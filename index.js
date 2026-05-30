@@ -162,7 +162,7 @@ export default {
       query += ` ORDER BY ${orderMap[sort] || 'ts DESC'} LIMIT 200`;
 
       const { results } = await env.DB.prepare(query).bind(...params).all();
-      return json({ listings: results.map(r => ({ ...r, pieces: JSON.parse(r.pieces) })) });
+      return json({ listings: results.map(r => ({ ...r, pieces: JSON.parse(r.pieces || '[]'), scuffness: r.scuffness ? JSON.parse(r.scuffness) : null })) });
     }
 
     // ── Listings: stats ────────────────────────────────────────────────
@@ -498,6 +498,7 @@ export default {
       const body = await request.json();
       const fields = [];
       const vals = [];
+      if (body.armour_type !== undefined) { fields.push('armour_type = ?'); vals.push(body.armour_type); }
       if (body.set_name !== undefined) { fields.push('set_name = ?'); vals.push(body.set_name); }
       if (body.pieces !== undefined) { fields.push('pieces = ?'); vals.push(JSON.stringify(body.pieces)); }
       if (body.for_offers !== undefined) { fields.push('for_offers = ?'); vals.push(body.for_offers ? 1 : 0); }
