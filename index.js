@@ -193,13 +193,12 @@ export default {
       const id = generateId();
       const now = Date.now();
 
-      const { forOffers, pageId, currentOffer, currentOfferIgn, boughtFor } = body;
+      const { forOffers, pageId, currentOffer, currentOfferIgn, boughtFor, scuffness } = body;
       // Try to add columns if they don't exist yet (D1 ignores errors on existing columns)
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN for_offers INTEGER DEFAULT 0`).run(); } catch(e) {}
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN page_id TEXT`).run(); } catch(e) {}
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN scuffness TEXT`).run(); } catch(e) {}
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN current_offer TEXT`).run(); } catch(e) {}
-      try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN scuffness TEXT`).run(); } catch(e) {}
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN current_offer_ign TEXT`).run(); } catch(e) {}
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN bought_for TEXT`).run(); } catch(e) {}
 
