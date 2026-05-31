@@ -162,7 +162,7 @@ export default {
       query += ` ORDER BY ${orderMap[sort] || 'ts DESC'} LIMIT 200`;
 
       const { results } = await env.DB.prepare(query).bind(...params).all();
-      return json({ listings: results.map(r => ({ ...r, pieces: JSON.parse(r.pieces || '[]'), scuffness: r.scuffness ? JSON.parse(r.scuffness) : null })) });
+      return json({ listings: results.map(r => ({ ...r, pieces: JSON.parse(r.pieces || '[]'), scuffness: r.scuffness ? JSON.parse(r.scuffness) : null, updated_at: r.updated_at || null })) });
     }
 
     // ── Listings: stats ────────────────────────────────────────────────
@@ -225,6 +225,7 @@ export default {
       const session = await getSession(request, env);
       if (!session) return err('Unauthorised', 401);
       const id = url.pathname.split('/')[2];
+      try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN updated_at INTEGER`).run(); } catch(e) {}
       const listing = await env.DB.prepare(`SELECT uuid FROM listings WHERE id = ?`).bind(id).first();
       if (!listing) return err('Not found', 404);
       if (listing.uuid !== session.uuid) return err('Forbidden', 403);
@@ -492,6 +493,8 @@ export default {
       const session = await getSession(request, env);
       if (!session) return err('Unauthorised', 401);
       const id = url.pathname.split('/')[2];
+      try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN updated_at INTEGER`).run(); } catch(e) {}
+      try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN updated_at INTEGER`).run(); } catch(e) {}
       const listing = await env.DB.prepare(`SELECT uuid FROM listings WHERE id = ?`).bind(id).first();
       if (!listing) return err('Not found', 404);
       if (listing.uuid !== session.uuid) return err('Forbidden', 403);
@@ -592,4 +595,5 @@ export default {
     return err('Not found', 404);
     
   },
-};
+}      fields.push('updated_at = ?'); vals.push(Date.now());
+;
