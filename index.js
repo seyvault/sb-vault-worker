@@ -512,6 +512,7 @@ export default {
       if (body.bought_for !== undefined) { fields.push('bought_for = ?'); vals.push(body.bought_for || ''); }
       if (body.scuffness !== undefined) { fields.push('scuffness = ?'); vals.push(body.scuffness ? JSON.stringify(body.scuffness) : null); }
       if (body.page_id !== undefined) { fields.push('page_id = ?'); vals.push(body.page_id || null); }
+      fields.push('updated_at = ?'); vals.push(Date.now());
       if (!fields.length) return err('Nothing to update');
       // Add migration for new columns
       try { await env.DB.prepare(`ALTER TABLE listings ADD COLUMN current_offer TEXT`).run(); } catch(e) {}
@@ -540,7 +541,86 @@ export default {
       return json({ ok: true });
     }
 
-// ── Reports: submit ────────────────────────────────────────────────
+
+    // ── Seymour: ensure table ────────────────────────────────────────
+    async function ensureSeymour(env){
+      try { await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_collections (
+        uuid TEXT PRIMARY KEY, ign TEXT, pieces TEXT, sets TEXT, updated_at INTEGER
+      )`).run(); } catch(e) {}
+    }
+
+    // ── Seymour: list all public collections ─────────────────────────
+    if (url.pathname === '/seymour/collections' && request.method === 'GET') {
+      await ensureSeymour(env);
+      const { results } = await env.DB.prepare(
+        `SELECT uuid, ign, pieces, sets, updated_at FROM seymour_collections ORDER BY updated_at DESC LIMIT 300`
+      ).all();
+      const out = (results || []).map(r => {
+        let pieces = [];
+        try { pieces = JSON.parse(r.pieces || '[]'); } catch(e) {}
+        let sets = [];
+        try { sets = JSON.parse(r.sets || '[]'); } catch(e) {}
+        const cats = {};
+        for (const p of pieces) cats[p.cat] = (cats[p.cat] || 0) + 1;
+        const slots = {};
+        for (const p of pieces) slots[p.slot] = (slots[p.slot] || 0) + 1;
+        return { uuid: r.uuid, ign: r.ign, count: pieces.length, sets: sets.length,
+                 cats, slots, updated_at: r.updated_at };
+      });
+      return json({ collections: out });
+    }
+
+    // ── Seymour: fetch one collection ────────────────────────────────
+    if (url.pathname === '/seymour/collection' && request.method === 'GET') {
+      await ensureSeymour(env);
+      const uuid = (url.searchParams.get('uuid') || '').replace(/-/g, '');
+      if (!uuid) return err('uuid required');
+      const row = await env.DB.prepare(
+        `SELECT uuid, ign, pieces, sets, updated_at FROM seymour_collections WHERE uuid = ?`
+      ).bind(uuid).first();
+      if (!row) return json({ uuid, ign: '', pieces: [], sets: [], updated_at: 0 });
+      let pieces = [], sets = [];
+      try { pieces = JSON.parse(row.pieces || '[]'); } catch(e) {}
+      try { sets = JSON.parse(row.sets || '[]'); } catch(e) {}
+      return json({ uuid: row.uuid, ign: row.ign, pieces, sets, updated_at: row.updated_at });
+    }
+
+    // ── Seymour: publish your collection ─────────────────────────────
+    if (url.pathname === '/seymour/collection' && request.method === 'PUT') {
+      const session = await getSession(request, env);
+      if (!session) return err('Unauthorised', 401);
+      await ensureSeymour(env);
+      const body = await request.json();
+      const pieces = Array.isArray(body.pieces) ? body.pieces.slice(0, 4000) : [];
+      const sets   = Array.isArray(body.sets)   ? body.sets.slice(0, 500)    : [];
+      const slim = pieces.map(p => ({
+        id: String(p.id || '').slice(0, 60), slot: p.slot, hex: p.hex,
+        cat: p.cat, ts: p.ts || 0,
+        best: p.best ? { name: p.best.name, hex: p.best.hex,
+                         dE: Math.round((p.best.dE || 0) * 1000) / 1000,
+                         abs: p.best.abs | 0 } : null
+      }));
+      await env.DB.prepare(
+        `INSERT INTO seymour_collections (uuid, ign, pieces, sets, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(uuid) DO UPDATE SET
+           ign = excluded.ign, pieces = excluded.pieces,
+           sets = excluded.sets, updated_at = excluded.updated_at`
+      ).bind(session.uuid, session.username || '', JSON.stringify(slim),
+             JSON.stringify(sets), Date.now()).run();
+      return json({ ok: true, count: slim.length });
+    }
+
+    // ── Seymour: unpublish ───────────────────────────────────────────
+    if (url.pathname === '/seymour/collection' && request.method === 'DELETE') {
+      const session = await getSession(request, env);
+      if (!session) return err('Unauthorised', 401);
+      await ensureSeymour(env);
+      await env.DB.prepare(`DELETE FROM seymour_collections WHERE uuid = ?`).bind(session.uuid).run();
+      return json({ ok: true });
+    }
+
+    // ── Reports: submit ────────────────────────────────────────────────
     if (url.pathname === '/reports' && request.method === 'POST') {
       const body = await request.json();
       const { type, targetId, targetIgn, reason, notes, reporterIgn, reporterUuid } = body;
@@ -595,5 +675,5 @@ export default {
     return err('Not found', 404);
     
   },
-}      fields.push('updated_at = ?'); vals.push(Date.now());
+}
 ;
