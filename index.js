@@ -46,6 +46,7 @@ export default {
     if (url.pathname === '/auth/token' && request.method === 'POST') {
       const body = await request.json();
       const { code, code_verifier } = body;
+      const redirectUri = body.redirect_uri || env.MCID_REDIRECT_URI;
       if (!code || !code_verifier) return err('Missing code or code_verifier');
 
       const tokenRes = await fetch('https://mc-id.com/api/auth/oauth2/token', {
@@ -56,7 +57,7 @@ export default {
           code,
           client_id: env.MCID_CLIENT_ID,
           client_secret: env.MCID_CLIENT_SECRET,
-          redirect_uri: env.MCID_REDIRECT_URI,
+          redirect_uri: redirectUri,
           code_verifier,
         }),
       });
