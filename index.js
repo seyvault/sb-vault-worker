@@ -27,7 +27,108 @@ function generateId() {
   return crypto.randomUUID().replace(/-/g, '');
 }
 
+// ══════════════════════════════════════════════════════════════════
+// Seymour: minimal NBT reader (gzip + base64 -> item colour + id)
+// ══════════════════════════════════════════════════════════════════
+const SEYMOUR_TAGS = new Set(['VELVET_TOP_HAT','CASHMERE_JACKET','SATIN_TROUSERS','OXFORD_SHOES']);
+
+async function gunzipB64(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const ds = new DecompressionStream('gzip');
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function nbtParse(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let p = 0;
+  const str = () => { const n = dv.getUint16(p); p += 2;
+    const s = new TextDecoder().decode(buf.subarray(p, p + n)); p += n; return s; };
+  function payload(type) {
+    switch (type) {
+      case 1:  { const v = dv.getInt8(p);    p += 1; return v; }
+      case 2:  { const v = dv.getInt16(p);   p += 2; return v; }
+      case 3:  { const v = dv.getInt32(p);   p += 4; return v; }
+      case 4:  { const v = Number(dv.getBigInt64(p)); p += 8; return v; }
+      case 5:  { const v = dv.getFloat32(p); p += 4; return v; }
+      case 6:  { const v = dv.getFloat64(p); p += 8; return v; }
+      case 7:  { const n = dv.getInt32(p); p += 4; const a = buf.subarray(p, p + n); p += n; return a; }
+      case 8:  return str();
+      case 9:  { const t = dv.getInt8(p); p += 1; const n = dv.getInt32(p); p += 4;
+                 const a = []; for (let i = 0; i < n; i++) a.push(payload(t)); return a; }
+      case 10: { const o = {}; for (;;) { const t = dv.getInt8(p); p += 1; if (t === 0) break;
+                 const k = str(); o[k] = payload(t); } return o; }
+      case 11: { const n = dv.getInt32(p); p += 4; const a = [];
+                 for (let i = 0; i < n; i++) { a.push(dv.getInt32(p)); p += 4; } return a; }
+      case 12: { const n = dv.getInt32(p); p += 4; const a = [];
+                 for (let i = 0; i < n; i++) { a.push(Number(dv.getBigInt64(p))); p += 8; } return a; }
+      default: throw new Error('bad NBT tag ' + type);
+    }
+  }
+  const t = dv.getInt8(p); p += 1;
+  if (t !== 10) throw new Error('root not compound');
+  str();
+  return payload(10);
+}
+
+// Pull { id, hex } out of an auction's item_bytes; null if not Seymour
+async function seymourFromBytes(itemBytes) {
+  try {
+    const root = nbtParse(await gunzipB64(itemBytes));
+    const item = root?.i?.[0];
+    if (!item) return null;
+    const id = item.tag?.ExtraAttributes?.id;
+    if (!id || !SEYMOUR_TAGS.has(id)) return null;
+    const colour = item.tag?.display?.color;
+    if (typeof colour !== 'number') return null;
+    return { id, hex: (colour >>> 0).toString(16).padStart(6, '0').toUpperCase().slice(-6) };
+  } catch (e) { return null; }
+}
+
+async function ensureSales(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_sales (
+    auction_uuid TEXT PRIMARY KEY,
+    item_id TEXT, hex TEXT, price INTEGER, bin INTEGER,
+    seller TEXT, buyer TEXT, sold_at INTEGER
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sales_hex  ON seymour_sales(hex)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sales_time ON seymour_sales(sold_at DESC)`).run();
+}
+
+// Polled once a minute by the cron trigger
+async function pollEndedAuctions(env) {
+  await ensureSales(env);
+  const res = await fetch('https://api.hypixel.net/skyblock/auctions_ended');
+  if (!res.ok) return { ok: false, status: res.status };
+  const data = await res.json();
+  const list = data.auctions || [];
+  const rows = [];
+  for (const a of list) {
+    if (!a.item_bytes) continue;
+    const sey = await seymourFromBytes(a.item_bytes);
+    if (!sey) continue;
+    rows.push([a.auction_id, sey.id, sey.hex, a.price | 0, a.bin ? 1 : 0,
+               a.seller || '', a.buyer || '', a.timestamp || Date.now()]);
+  }
+  for (const r of rows) {
+    try {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO seymour_sales
+         (auction_uuid,item_id,hex,price,bin,seller,buyer,sold_at)
+         VALUES (?,?,?,?,?,?,?,?)`).bind(...r).run();
+    } catch (e) {}
+  }
+  return { ok: true, scanned: list.length, stored: rows.length };
+}
+
+
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(pollEndedAuctions(env).catch(e => console.error('poll failed', e)));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -91,7 +192,9 @@ export default {
         { expirationTtl: 60 * 60 * 24 * 30 },
       );
 
-      return json({ token: sessionToken, user: { uuid: account.uuid, username: account.username } });
+      const urow = await env.DB.prepare(`SELECT discord FROM users WHERE uuid = ?`).bind(account.uuid).first();
+      return json({ token: sessionToken, user: { uuid: account.uuid, username: account.username,
+                                                 discord: (urow && urow.discord) || '' } });
     }
 
     // ── Auth: get current user ─────────────────────────────────────────
@@ -543,6 +646,46 @@ export default {
     }
 
 
+
+    // ── Seymour: sales history ───────────────────────────────────────
+    if (url.pathname === '/seymour/sales' && request.method === 'GET') {
+      try {
+        await ensureSales(env);
+        const hex   = (url.searchParams.get('hex') || '').replace('#','').toUpperCase();
+        const item  = url.searchParams.get('item') || '';
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
+        let sql = `SELECT auction_uuid,item_id,hex,price,bin,seller,buyer,sold_at FROM seymour_sales`;
+        const cond = [], vals = [];
+        if (/^[0-9A-F]{6}$/.test(hex)) { cond.push('hex = ?'); vals.push(hex); }
+        if (SEYMOUR_TAGS.has(item))    { cond.push('item_id = ?'); vals.push(item); }
+        if (cond.length) sql += ' WHERE ' + cond.join(' AND ');
+        sql += ' ORDER BY sold_at DESC LIMIT ?'; vals.push(limit);
+        const { results } = await env.DB.prepare(sql).bind(...vals).all();
+        const total = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
+        return json({ sales: results || [], tracked: total ? total.c : 0 });
+      } catch (e) { return err('sales error: ' + (e && e.message ? e.message : String(e)), 500); }
+    }
+
+    // ── Seymour: manual poll (debug / backfill trigger) ──────────────
+    if (url.pathname === '/seymour/poll' && request.method === 'POST') {
+      try { return json(await pollEndedAuctions(env)); }
+      catch (e) { return err('poll error: ' + (e && e.message ? e.message : String(e)), 500); }
+    }
+
+    // ── Seymour: profile (discord tag) ───────────────────────────────
+    if (url.pathname === '/seymour/profile' && request.method === 'PUT') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        const body = await request.json();
+        let discord = typeof body.discord === 'string' ? body.discord.trim().slice(0, 40) : '';
+        if (discord && !/^[a-zA-Z0-9._#\- ]{2,40}$/.test(discord)) return err('Invalid Discord username');
+        await env.DB.prepare(`UPDATE users SET discord = ?, updated_at = ? WHERE uuid = ?`)
+          .bind(discord || null, Date.now(), session.uuid).run();
+        return json({ ok: true, discord });
+      } catch (e) { return err('profile error: ' + (e && e.message ? e.message : String(e)), 500); }
+    }
+
     // ── Seymour: ensure table ────────────────────────────────────────
     async function ensureSeymour(env){
       await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_collections (
@@ -558,7 +701,9 @@ export default {
     if (url.pathname === '/seymour/collections' && request.method === 'GET') {
       await ensureSeymour(env);
       const { results } = await env.DB.prepare(
-        `SELECT uuid, ign, pieces, sets, updated_at FROM seymour_collections ORDER BY updated_at DESC LIMIT 300`
+        `SELECT c.uuid, c.ign, c.pieces, c.sets, c.updated_at, u.discord
+           FROM seymour_collections c LEFT JOIN users u ON u.uuid = c.uuid
+          ORDER BY c.updated_at DESC LIMIT 300`
       ).all();
       const out = (results || []).map(r => {
         let pieces = [];
@@ -569,8 +714,8 @@ export default {
         for (const p of pieces) cats[p.cat] = (cats[p.cat] || 0) + 1;
         const slots = {};
         for (const p of pieces) slots[p.slot] = (slots[p.slot] || 0) + 1;
-        return { uuid: r.uuid, ign: r.ign, count: pieces.length, sets: sets.length,
-                 cats, slots, updated_at: r.updated_at };
+        return { uuid: r.uuid, ign: r.ign, discord: r.discord || '', count: pieces.length,
+                 sets: sets.length, cats, slots, updated_at: r.updated_at };
       });
       return json({ collections: out });
     }
@@ -581,13 +726,16 @@ export default {
       const uuid = (url.searchParams.get('uuid') || '').replace(/-/g, '');
       if (!uuid) return err('uuid required');
       const row = await env.DB.prepare(
-        `SELECT uuid, ign, pieces, sets, updated_at FROM seymour_collections WHERE uuid = ?`
+        `SELECT c.uuid, c.ign, c.pieces, c.sets, c.updated_at, u.discord
+           FROM seymour_collections c LEFT JOIN users u ON u.uuid = c.uuid
+          WHERE c.uuid = ?`
       ).bind(uuid).first();
-      if (!row) return json({ uuid, ign: '', pieces: [], sets: [], updated_at: 0 });
+      if (!row) return json({ uuid, ign: '', discord: '', pieces: [], sets: [], updated_at: 0 });
       let pieces = [], sets = [];
       try { pieces = JSON.parse(row.pieces || '[]'); } catch(e) {}
       try { sets = JSON.parse(row.sets || '[]'); } catch(e) {}
-      return json({ uuid: row.uuid, ign: row.ign, pieces, sets, updated_at: row.updated_at });
+      return json({ uuid: row.uuid, ign: row.ign, discord: row.discord || '',
+                    pieces, sets, updated_at: row.updated_at });
     }
 
     // ── Seymour: publish your collection ─────────────────────────────

@@ -12,11 +12,14 @@ binding = "SESSIONS"
 id = "39b5f3269c454e768759a0491a85719e"
 
 [vars]
-MCID_REDIRECT_URI = "https://sb-vault.github.io/"
+MCID_REDIRECT_URI = "https://seyvault.github.io/"
 
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "sb-vault-images"
+
+[triggers]
+crons = ["* * * * *"]
 
 [observability]
 enabled = true
