@@ -544,9 +544,13 @@ export default {
 
     // ── Seymour: ensure table ────────────────────────────────────────
     async function ensureSeymour(env){
-      try { await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_collections (
-        uuid TEXT PRIMARY KEY, ign TEXT, pieces TEXT, sets TEXT, updated_at INTEGER
-      )`).run(); } catch(e) {}
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_collections (
+        uuid TEXT PRIMARY KEY,
+        ign TEXT,
+        pieces TEXT,
+        sets TEXT,
+        updated_at INTEGER
+      )`).run();
     }
 
     // ── Seymour: list all public collections ─────────────────────────
@@ -587,28 +591,32 @@ export default {
 
     // ── Seymour: publish your collection ─────────────────────────────
     if (url.pathname === '/seymour/collection' && request.method === 'PUT') {
-      const session = await getSession(request, env);
-      if (!session) return err('Unauthorised', 401);
-      await ensureSeymour(env);
-      const body = await request.json();
-      const pieces = Array.isArray(body.pieces) ? body.pieces.slice(0, 4000) : [];
-      const sets   = Array.isArray(body.sets)   ? body.sets.slice(0, 500)    : [];
-      const slim = pieces.map(p => ({
-        id: String(p.id || '').slice(0, 60), slot: p.slot, hex: p.hex,
-        cat: p.cat, ts: p.ts || 0,
-        best: p.best ? { name: p.best.name, hex: p.best.hex,
-                         dE: Math.round((p.best.dE || 0) * 1000) / 1000,
-                         abs: p.best.abs | 0 } : null
-      }));
-      await env.DB.prepare(
-        `INSERT INTO seymour_collections (uuid, ign, pieces, sets, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(uuid) DO UPDATE SET
-           ign = excluded.ign, pieces = excluded.pieces,
-           sets = excluded.sets, updated_at = excluded.updated_at`
-      ).bind(session.uuid, session.username || '', JSON.stringify(slim),
-             JSON.stringify(sets), Date.now()).run();
-      return json({ ok: true, count: slim.length });
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await ensureSeymour(env);
+        const body = await request.json();
+        const pieces = Array.isArray(body.pieces) ? body.pieces.slice(0, 4000) : [];
+        const sets   = Array.isArray(body.sets)   ? body.sets.slice(0, 500)    : [];
+        const slim = pieces.map(p => ({
+          id: String(p.id || '').slice(0, 60),
+          slot: p.slot, hex: p.hex, cat: p.cat, ts: p.ts || 0,
+          best: p.best ? { name: p.best.name, hex: p.best.hex,
+                           dE: Math.round((p.best.dE || 0) * 1000) / 1000,
+                           abs: p.best.abs | 0 } : null
+        }));
+        await env.DB.prepare(
+          `INSERT INTO seymour_collections (uuid, ign, pieces, sets, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(uuid) DO UPDATE SET
+             ign = excluded.ign, pieces = excluded.pieces,
+             sets = excluded.sets, updated_at = excluded.updated_at`
+        ).bind(session.uuid, session.username || '', JSON.stringify(slim),
+               JSON.stringify(sets), Date.now()).run();
+        return json({ ok: true, count: slim.length });
+      } catch (e) {
+        return err('DB error: ' + (e && e.message ? e.message : String(e)), 500);
+      }
     }
 
     // ── Seymour: unpublish ───────────────────────────────────────────
