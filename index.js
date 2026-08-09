@@ -83,16 +83,62 @@ async function seymourFromBytes(itemBytes) {
     if (!id || !SEYMOUR_TAGS.has(id)) return null;
     const colour = item.tag?.display?.color;
     if (typeof colour !== 'number') return null;
-    return { id, hex: (colour >>> 0).toString(16).padStart(6, '0').toUpperCase().slice(-6) };
+    const iu = item.tag?.ExtraAttributes?.uuid || '';
+    return { id, itemUuid: String(iu),
+             hex: (colour >>> 0).toString(16).padStart(6, '0').toUpperCase().slice(-6) };
   } catch (e) { return null; }
+}
+
+
+// Backfill historic Seymour sales from Coflnet (they store colour + uId).
+// Rate limits: 30 req / 10s, 100 req / min -> we stay well under.
+async function coflBackfill(env, tag, page, pageSize) {
+  await ensureSales(env);
+  const listRes = await fetch(
+    `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=${pageSize}`);
+  if (!listRes.ok) return { ok: false, status: listRes.status, stage: 'list' };
+  const list = await listRes.json();
+  let stored = 0, checked = 0, skipped = 0;
+  for (const a of (list || [])) {
+    checked++;
+    const exists = await env.DB.prepare(
+      `SELECT 1 FROM seymour_sales WHERE auction_uuid = ?`).bind(a.uuid).first();
+    if (exists) { skipped++; continue; }
+    const dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`);
+    if (!dRes.ok) continue;
+    const d = await dRes.json();
+    const flat = d.flatNbt || {};
+    let hex = '';
+    for (const k of ['color','Color','colour']) {
+      if (flat[k]) { hex = String(flat[k]).replace('#','').toUpperCase(); break; }
+    }
+    if (/^\d{1,8}$/.test(hex)) hex = (parseInt(hex,10)>>>0).toString(16).toUpperCase();
+    hex = hex.padStart(6,'0').slice(-6);
+    if (!/^[0-9A-F]{6}$/.test(hex)) continue;
+    const uid = String(flat.uid || flat.uId || '').replace(/-/g,'').slice(-12);
+    const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO seymour_sales
+       (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
+            d.bin ? 1 : 0, d.auctioneerId || '', buyer,
+            Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
+    stored++;
+    await new Promise(r => setTimeout(r, 700));   // ~1.4 req/s
+  }
+  return { ok: true, tag, page, checked, stored, skipped };
 }
 
 async function ensureSales(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_sales (
     auction_uuid TEXT PRIMARY KEY,
-    item_id TEXT, hex TEXT, price INTEGER, bin INTEGER,
-    seller TEXT, buyer TEXT, sold_at INTEGER
+    item_id TEXT, hex TEXT, item_uuid TEXT, price INTEGER, bin INTEGER,
+    seller TEXT, buyer TEXT, sold_at INTEGER, source TEXT
   )`).run();
+  try { await env.DB.prepare(`ALTER TABLE seymour_sales ADD COLUMN item_uuid TEXT`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE seymour_sales ADD COLUMN source TEXT`).run(); } catch (e) {}
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sales_item ON seymour_sales(item_uuid)`).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sales_hex  ON seymour_sales(hex)`).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sales_time ON seymour_sales(sold_at DESC)`).run();
 }
@@ -109,15 +155,15 @@ async function pollEndedAuctions(env) {
     if (!a.item_bytes) continue;
     const sey = await seymourFromBytes(a.item_bytes);
     if (!sey) continue;
-    rows.push([a.auction_id, sey.id, sey.hex, a.price | 0, a.bin ? 1 : 0,
-               a.seller || '', a.buyer || '', a.timestamp || Date.now()]);
+    rows.push([a.auction_id, sey.id, sey.hex, sey.itemUuid, a.price | 0, a.bin ? 1 : 0,
+               a.seller || '', a.buyer || '', a.timestamp || Date.now(), 'hypixel']);
   }
   for (const r of rows) {
     try {
       await env.DB.prepare(
         `INSERT OR IGNORE INTO seymour_sales
-         (auction_uuid,item_id,hex,price,bin,seller,buyer,sold_at)
-         VALUES (?,?,?,?,?,?,?,?)`).bind(...r).run();
+         (auction_uuid,item_id,hex,item_uuid,price,bin,seller,buyer,sold_at,source)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(...r).run();
     } catch (e) {}
   }
   return { ok: true, scanned: list.length, stored: rows.length };
@@ -647,23 +693,89 @@ export default {
 
 
 
+
+
+    // ── Seymour: every piece across every published collection ───────
+    if (url.pathname === '/seymour/allpieces' && request.method === 'GET') {
+      try {
+        await ensureSeymour(env);
+        const cap = Math.min(parseInt(url.searchParams.get('limit') || '25000', 10) || 25000, 40000);
+        const { results } = await env.DB.prepare(
+          `SELECT c.uuid, c.ign, c.pieces FROM seymour_collections c
+            ORDER BY c.updated_at DESC LIMIT 200`).all();
+        const out = [];
+        let truncated = false;
+        for (const row of (results || [])) {
+          let ps = [];
+          try { ps = JSON.parse(row.pieces || '[]'); } catch (e) { continue; }
+          for (const p of ps) {
+            if (out.length >= cap) { truncated = true; break; }
+            out.push({ id: p.id, slot: p.slot, hex: p.hex, cat: p.cat, ts: p.ts,
+                       best: p.best || null, owner: row.uuid, ign: row.ign || '' });
+          }
+          if (truncated) break;
+        }
+        return json({ pieces: out, count: out.length, truncated,
+                      collections: (results || []).length });
+      } catch (e) { return err('allpieces error: ' + e.message, 500); }
+    }
+
+    // ── Seymour: one item's full sale chain (by item uid) ────────────
+    if (url.pathname === '/seymour/item' && request.method === 'GET') {
+      try {
+        await ensureSales(env);
+        const uid = (url.searchParams.get('uid') || '').toLowerCase();
+        if (!uid) return err('uid required');
+        const { results } = await env.DB.prepare(
+          `SELECT * FROM seymour_sales WHERE lower(item_uid) = ? ORDER BY sold_at ASC`
+        ).bind(uid).all();
+        return json({ uid, sales: results || [] });
+      } catch (e) { return err('item error: ' + e.message, 500); }
+    }
+
+    // ── Seymour: Coflnet backfill ────────────────────────────────────
+    if (url.pathname === '/seymour/backfill' && request.method === 'POST') {
+      try {
+        const b = await request.json().catch(() => ({}));
+        const tag = SEYMOUR_TAGS.has(b.tag) ? b.tag : 'VELVET_TOP_HAT';
+        const page = Math.max(0, parseInt(b.page || 0, 10) || 0);
+        const size = Math.min(Math.max(parseInt(b.pageSize || 20, 10) || 20, 1), 60);
+        return json(await coflBackfill(env, tag, page, size));
+      } catch (e) { return err('backfill error: ' + e.message, 500); }
+    }
+
     // ── Seymour: sales history ───────────────────────────────────────
     if (url.pathname === '/seymour/sales' && request.method === 'GET') {
       try {
         await ensureSales(env);
         const hex   = (url.searchParams.get('hex') || '').replace('#','').toUpperCase();
         const item  = url.searchParams.get('item') || '';
-        const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
-        let sql = `SELECT auction_uuid,item_id,hex,price,bin,seller,buyer,sold_at FROM seymour_sales`;
+        const uid   = (url.searchParams.get('uid')  || '').toLowerCase();
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '400', 10) || 400, 1000);
+        let sql = `SELECT s.*,
+          (SELECT COUNT(*) FROM seymour_sales x
+            WHERE x.item_uid = s.item_uid AND s.item_uid IS NOT NULL AND s.item_uid <> '') AS chain_len,
+          (SELECT MAX(x.sold_at) FROM seymour_sales x
+            WHERE x.item_uid = s.item_uid AND s.item_uid IS NOT NULL AND s.item_uid <> '') AS last_sold
+          FROM seymour_sales s`;
         const cond = [], vals = [];
-        if (/^[0-9A-F]{6}$/.test(hex)) { cond.push('hex = ?'); vals.push(hex); }
-        if (SEYMOUR_TAGS.has(item))    { cond.push('item_id = ?'); vals.push(item); }
+        if (/^[0-9A-F]{6}$/.test(hex)) { cond.push('s.hex = ?'); vals.push(hex); }
+        if (SEYMOUR_TAGS.has(item))    { cond.push('s.item_id = ?'); vals.push(item); }
+        if (uid)                       { cond.push('lower(s.item_uid) = ?'); vals.push(uid); }
         if (cond.length) sql += ' WHERE ' + cond.join(' AND ');
-        sql += ' ORDER BY sold_at DESC LIMIT ?'; vals.push(limit);
+        sql += ' ORDER BY s.sold_at DESC LIMIT ?'; vals.push(limit);
         const { results } = await env.DB.prepare(sql).bind(...vals).all();
         const total = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
-        return json({ sales: results || [], tracked: total ? total.c : 0 });
-      } catch (e) { return err('sales error: ' + (e && e.message ? e.message : String(e)), 500); }
+        const meta  = await env.DB.prepare(
+          `SELECT v FROM seymour_meta WHERE k = 'tracking_started'`).first();
+        const first = await env.DB.prepare(`SELECT MIN(sold_at) AS m FROM seymour_sales`).first();
+        return json({
+          sales: results || [],
+          tracked: total ? total.c : 0,
+          tracking_started: meta ? Number(meta.v) : null,
+          earliest_sale: first && first.m ? Number(first.m) : null
+        });
+      } catch (e) { return err('sales error: ' + e.message, 500); }
     }
 
     // ── Seymour: manual poll (debug / backfill trigger) ──────────────
