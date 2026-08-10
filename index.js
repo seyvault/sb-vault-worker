@@ -48,7 +48,7 @@ async function setMeta(env, k, v) {
 async function backfillStep(env, budget) {
   await ensureSales(env);
   if (budget === undefined) {
-    budget = parseInt(await getMeta(env, 'bf_budget', '24'), 10) || 24;
+    budget = parseInt(await getMeta(env, 'bf_budget', '40'), 10) || 40;
   }
   budget = Math.min(Math.max(budget, 1), 45);   // 45 + 1 keeps us under the 50-subrequest cap
   if ((await getMeta(env, 'bf_enabled', '0')) !== '1') return { skipped: 'disabled' };
@@ -68,6 +68,8 @@ async function backfillStep(env, budget) {
   if (!Array.isArray(list) || list.length === 0) {
     await setMeta(env, 'bf_tag_index', ti + 1);
     await setMeta(env, 'bf_page', 0);
+    await setMeta(env, 'bf_last_result', JSON.stringify(
+      { at: Date.now(), tag, page, listed: 0, note: 'page empty -> moved to next piece' }));
     return { tagFinished: tag, next: BF_TAGS[ti + 1] || null };
   }
 
@@ -101,7 +103,7 @@ async function backfillStep(env, budget) {
             d.bin ? 1 : 0, d.auctioneerId || '', buyer,
             Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
     stored++;
-    await new Promise(r => setTimeout(r, 900));   // ~1.1 req/s, inside Coflnet's ~1/s guidance
+    await new Promise(r => setTimeout(r, 1000));  // exactly Coflnet's ~1 req/s guidance
   }
 
   // Only advance the page once we've worked through everything new on it
@@ -112,6 +114,9 @@ async function backfillStep(env, budget) {
     if (!prev || oldest < prev) await setMeta(env, 'bf_oldest', oldest);
   }
   await setMeta(env, 'bf_last_run', Date.now());
+  await setMeta(env, 'bf_last_result', JSON.stringify(
+    { at: Date.now(), tag, page, listed: list.length, newFetched: spent, stored,
+      oldest, note: spent === 0 ? 'page already fully archived' : 'ok' }));
   return { ok: true, tag, page, stored, examined: list.length, oldest, budget };
 }
 
@@ -835,6 +840,7 @@ export default {
         const page    = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
         const last    = parseInt(await getMeta(env, 'bf_last_run', '0'), 10) || 0;
         const started = parseInt(await getMeta(env, 'tracking_started', '0'), 10) || 0;
+        const lastRes = await getMeta(env, 'bf_last_result', 'null');
         const row     = await env.DB.prepare(
           `SELECT COUNT(*) AS c, MIN(sold_at) AS mn FROM seymour_sales`).first();
         const now = Date.now();
@@ -847,7 +853,8 @@ export default {
           oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
           percent: Math.round(pct * 10) / 10,
           totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
-          budget: parseInt(await getMeta(env, 'bf_budget', '24'), 10)
+          budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+          lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })()
         });
       } catch (e) { return err('status error: ' + e.message, 500); }
     }
@@ -864,12 +871,13 @@ export default {
           await setMeta(env, 'bf_oldest', 0);
         }
         if (b.budget !== undefined) {
-          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 24, 1), 45);
+          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 40, 1), 45);
           await setMeta(env, 'bf_budget', bud);
         }
         await setMeta(env, 'bf_enabled', b.enabled ? '1' : '0');
         return json({ ok: true, enabled: !!b.enabled,
-                      budget: parseInt(await getMeta(env, 'bf_budget', '24'), 10) });
+                      budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+          lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })() });
       } catch (e) { return err('toggle error: ' + e.message, 500); }
     }
 
@@ -893,6 +901,48 @@ export default {
       } catch (e) { return err('backfill error: ' + e.message, 500); }
     }
 
+
+
+    // ── Seymour: cheap change-poll for live UI ───────────────────────
+    if (url.pathname === '/seymour/version' && request.method === 'GET') {
+      try {
+        await ensureSales(env);
+        const c = await env.DB.prepare(`SELECT COUNT(*) AS c, MAX(sold_at) AS m FROM seymour_sales`).first();
+        return json({ sales: c ? c.c : 0, newest: c && c.m ? c.m : 0,
+                      lastRun: parseInt(await getMeta(env, 'bf_last_run', '0'), 10) || 0 });
+      } catch (e) { return json({ sales: 0, newest: 0, lastRun: 0 }); }
+    }
+
+    // ── Seymour: uuid -> username (cached forever in D1) ─────────────
+    if (url.pathname === '/seymour/names' && request.method === 'GET') {
+      try {
+        await env.DB.prepare(
+          `CREATE TABLE IF NOT EXISTS mc_names (uuid TEXT PRIMARY KEY, name TEXT, fetched_at INTEGER)`).run();
+        const raw = (url.searchParams.get('uuids') || '').split(',')
+          .map(s => s.trim().replace(/-/g, '').toLowerCase())
+          .filter(s => /^[0-9a-f]{32}$/.test(s)).slice(0, 40);
+        const out = {};
+        const missing = [];
+        for (const u of raw) {
+          const r = await env.DB.prepare(`SELECT name FROM mc_names WHERE uuid = ?`).bind(u).first();
+          if (r && r.name) out[u] = r.name; else missing.push(u);
+        }
+        for (const u of missing.slice(0, 12)) {
+          try {
+            const res = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${u}`);
+            if (!res.ok) continue;
+            const p = await res.json();
+            if (p && p.name) {
+              out[u] = p.name;
+              await env.DB.prepare(
+                `INSERT OR REPLACE INTO mc_names (uuid,name,fetched_at) VALUES (?,?,?)`)
+                .bind(u, p.name, Date.now()).run();
+            }
+          } catch (e) {}
+        }
+        return json({ names: out });
+      } catch (e) { return err('names error: ' + e.message, 500); }
+    }
 
     // ── Seymour: diagnostics ─────────────────────────────────────────
     if (url.pathname === '/seymour/debug' && request.method === 'GET') {
@@ -1175,3 +1225,4 @@ export default {
   },
 }
 ;
+
