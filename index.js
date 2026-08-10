@@ -28,6 +28,94 @@ function generateId() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// Progressive backfill: walks back through SkyCofl a slice at a time,
+// driven by the same 1/min cron. ~9 requests per tick, far under the
+// 30-per-10s / 100-per-min limits.
+// ══════════════════════════════════════════════════════════════════
+const SEYMOUR_RELEASE = Date.parse('2023-02-01T00:00:00Z');
+const BF_TAGS = ['VELVET_TOP_HAT','CASHMERE_JACKET','SATIN_TROUSERS','OXFORD_SHOES'];
+
+async function getMeta(env, k, dflt) {
+  const r = await env.DB.prepare(`SELECT v FROM seymour_meta WHERE k = ?`).bind(k).first();
+  return r && r.v !== null && r.v !== undefined ? r.v : dflt;
+}
+async function setMeta(env, k, v) {
+  await env.DB.prepare(
+    `INSERT INTO seymour_meta (k,v) VALUES (?,?)
+     ON CONFLICT(k) DO UPDATE SET v = excluded.v`).bind(k, String(v)).run();
+}
+
+async function backfillStep(env, budget) {
+  await ensureSales(env);
+  if (budget === undefined) {
+    budget = parseInt(await getMeta(env, 'bf_budget', '24'), 10) || 24;
+  }
+  budget = Math.min(Math.max(budget, 1), 45);   // 45 + 1 keeps us under the 50-subrequest cap
+  if ((await getMeta(env, 'bf_enabled', '0')) !== '1') return { skipped: 'disabled' };
+
+  let ti   = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
+  let page = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
+  if (ti >= BF_TAGS.length) return { done: true };
+  const tag = BF_TAGS[ti];
+
+  const listRes = await fetch(
+    `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=100`);
+  if (listRes.status === 429) return { rateLimited: true, tag, page };
+  if (!listRes.ok) return { ok: false, status: listRes.status, tag, page };
+  const list = await listRes.json();
+
+  // Page empty -> this tag is exhausted, move to the next one
+  if (!Array.isArray(list) || list.length === 0) {
+    await setMeta(env, 'bf_tag_index', ti + 1);
+    await setMeta(env, 'bf_page', 0);
+    return { tagFinished: tag, next: BF_TAGS[ti + 1] || null };
+  }
+
+  let stored = 0, spent = 0, oldest = null;
+  for (const a of list) {
+    const end = Date.parse(a.end || '') || 0;
+    if (end && (!oldest || end < oldest)) oldest = end;
+    if (spent >= budget) break;
+    const seen = await env.DB.prepare(
+      `SELECT 1 FROM seymour_sales WHERE auction_uuid = ?`).bind(a.uuid).first();
+    if (seen) continue;
+    spent++;
+    const dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`);
+    if (dRes.status === 429) break;
+    if (!dRes.ok) continue;
+    const d = await dRes.json();
+    const flat = d.flatNbt || {};
+    let hex = '';
+    for (const k of ['color','Color','colour']) if (flat[k]) { hex = String(flat[k]); break; }
+    hex = hex.replace('#','').toUpperCase();
+    if (/^[0-9]{1,8}$/.test(hex)) hex = (parseInt(hex,10) >>> 0).toString(16).toUpperCase();
+    hex = hex.padStart(6,'0').slice(-6);
+    if (!/^[0-9A-F]{6}$/.test(hex)) continue;
+    const uid   = String(flat.uid || flat.uId || '').replace(/-/g,'').slice(-12);
+    const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO seymour_sales
+       (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
+            d.bin ? 1 : 0, d.auctioneerId || '', buyer,
+            Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
+    stored++;
+    await new Promise(r => setTimeout(r, 900));   // ~1.1 req/s, inside Coflnet's ~1/s guidance
+  }
+
+  // Only advance the page once we've worked through everything new on it
+  if (spent < budget) await setMeta(env, 'bf_page', page + 1);
+
+  if (oldest) {
+    const prev = parseInt(await getMeta(env, 'bf_oldest', '0'), 10) || 0;
+    if (!prev || oldest < prev) await setMeta(env, 'bf_oldest', oldest);
+  }
+  await setMeta(env, 'bf_last_run', Date.now());
+  return { ok: true, tag, page, stored, examined: list.length, oldest, budget };
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Seymour: minimal NBT reader (gzip + base64 -> item colour + id)
 // ══════════════════════════════════════════════════════════════════
 const SEYMOUR_TAGS = new Set(['VELVET_TOP_HAT','CASHMERE_JACKET','SATIN_TROUSERS','OXFORD_SHOES']);
@@ -172,7 +260,10 @@ async function pollEndedAuctions(env) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(pollEndedAuctions(env).catch(e => console.error('poll failed', e)));
+    ctx.waitUntil((async () => {
+      await pollEndedAuctions(env).catch(e => console.error('poll failed', e));
+      await backfillStep(env).catch(e => console.error('backfill failed', e));
+    })());
   },
 
   async fetch(request, env) {
@@ -733,6 +824,64 @@ export default {
       } catch (e) { return err('item error: ' + e.message, 500); }
     }
 
+
+    // ── Seymour: backfill control + progress ─────────────────────────
+    if (url.pathname === '/seymour/backfill/status' && request.method === 'GET') {
+      try {
+        await ensureSales(env);
+        const enabled = (await getMeta(env, 'bf_enabled', '0')) === '1';
+        const ti      = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
+        const oldest  = parseInt(await getMeta(env, 'bf_oldest', '0'), 10) || 0;
+        const page    = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
+        const last    = parseInt(await getMeta(env, 'bf_last_run', '0'), 10) || 0;
+        const started = parseInt(await getMeta(env, 'tracking_started', '0'), 10) || 0;
+        const row     = await env.DB.prepare(
+          `SELECT COUNT(*) AS c, MIN(sold_at) AS mn FROM seymour_sales`).first();
+        const now = Date.now();
+        const span = now - SEYMOUR_RELEASE;
+        const reached = oldest || (row && row.mn) || now;
+        const pct = Math.max(0, Math.min(100, ((now - reached) / span) * 100));
+        return json({
+          enabled, done: ti >= BF_TAGS.length,
+          tag: BF_TAGS[ti] || null, tagIndex: ti, tagCount: BF_TAGS.length, page,
+          oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
+          percent: Math.round(pct * 10) / 10,
+          totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
+          budget: parseInt(await getMeta(env, 'bf_budget', '24'), 10)
+        });
+      } catch (e) { return err('status error: ' + e.message, 500); }
+    }
+
+    if (url.pathname === '/seymour/backfill/toggle' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await ensureSales(env);
+        const b = await request.json().catch(() => ({}));
+        if (b.reset) {
+          await setMeta(env, 'bf_tag_index', 0);
+          await setMeta(env, 'bf_page', 0);
+          await setMeta(env, 'bf_oldest', 0);
+        }
+        if (b.budget !== undefined) {
+          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 24, 1), 45);
+          await setMeta(env, 'bf_budget', bud);
+        }
+        await setMeta(env, 'bf_enabled', b.enabled ? '1' : '0');
+        return json({ ok: true, enabled: !!b.enabled,
+                      budget: parseInt(await getMeta(env, 'bf_budget', '24'), 10) });
+      } catch (e) { return err('toggle error: ' + e.message, 500); }
+    }
+
+    // Run one backfill slice immediately (handy for testing)
+    if (url.pathname === '/seymour/backfill/step' && request.method === 'POST') {
+      try {
+        const b = await request.json().catch(() => ({}));
+        await setMeta(env, 'bf_enabled', '1');
+        return json(await backfillStep(env, Math.min(parseInt(b.budget || 8, 10) || 8, 20)));
+      } catch (e) { return err('step error: ' + e.message, 500); }
+    }
+
     // ── Seymour: Coflnet backfill ────────────────────────────────────
     if (url.pathname === '/seymour/backfill' && request.method === 'POST') {
       try {
@@ -830,6 +979,53 @@ export default {
                  sets: sets.length, cats, slots, updated_at: r.updated_at };
       });
       return json({ collections: out });
+    }
+
+
+    // ── Seymour: every piece across every collection ─────────────────
+    if (url.pathname === '/seymour/allpieces' && request.method === 'GET') {
+      try {
+        await ensureSeymour(env);
+        const { results } = await env.DB.prepare(
+          `SELECT c.uuid, c.ign, c.pieces FROM seymour_collections c ORDER BY c.updated_at DESC LIMIT 300`
+        ).all();
+        const out = [];
+        for (const r of (results || [])) {
+          let pieces = [];
+          try { pieces = JSON.parse(r.pieces || '[]'); } catch (e) {}
+          for (const p of pieces) {
+            if (out.length >= 40000) break;
+            out.push({ id: p.id, slot: p.slot, hex: p.hex, cat: p.cat, ts: p.ts || 0,
+                       best: p.best || null, owner: r.uuid, ign: r.ign || '' });
+          }
+          if (out.length >= 40000) break;
+        }
+        return json({ pieces: out, owners: (results || []).length });
+      } catch (e) { return err('allpieces error: ' + e.message, 500); }
+    }
+
+
+    // ── Seymour: every piece across every collection ─────────────────
+    if (url.pathname === '/seymour/allpieces' && request.method === 'GET') {
+      try {
+        await ensureSeymour(env);
+        const { results } = await env.DB.prepare(
+          `SELECT c.uuid, c.ign, c.pieces FROM seymour_collections c
+            ORDER BY c.updated_at DESC LIMIT 300`).all();
+        const out = [];
+        for (const r of (results || [])) {
+          let pieces = [];
+          try { pieces = JSON.parse(r.pieces || '[]'); } catch (e) { continue; }
+          for (const p of pieces) {
+            if (!p || !p.hex || !p.slot) continue;
+            out.push({ hex: p.hex, slot: p.slot, cat: p.cat, ts: p.ts || 0,
+                       best: p.best || null, owner: r.uuid, ign: r.ign || '' });
+            if (out.length >= 25000) break;
+          }
+          if (out.length >= 25000) break;
+        }
+        return json({ pieces: out, owners: (results || []).length });
+      } catch (e) { return err('pieces error: ' + e.message, 500); }
     }
 
     // ── Seymour: fetch one collection ────────────────────────────────
