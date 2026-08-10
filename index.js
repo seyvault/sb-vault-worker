@@ -51,7 +51,7 @@ async function backfillStep(env, budget) {
     budget = parseInt(await getMeta(env, 'bf_budget', '40'), 10) || 40;
   }
   budget = Math.min(Math.max(budget, 1), 45);   // 45 + 1 keeps us under the 50-subrequest cap
-  if ((await getMeta(env, 'bf_enabled', '0')) !== '1') return { skipped: 'disabled' };
+  
 
   let ti   = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
   let page = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
@@ -73,7 +73,7 @@ async function backfillStep(env, budget) {
     return { tagFinished: tag, next: BF_TAGS[ti + 1] || null };
   }
 
-  let stored = 0, spent = 0, oldest = null;
+  let stored = 0, spent = 0, oldest = null, skippedNoColour = 0;
   for (const a of list) {
     const end = Date.parse(a.end || '') || 0;
     if (end && (!oldest || end < oldest)) oldest = end;
@@ -86,14 +86,33 @@ async function backfillStep(env, budget) {
     if (dRes.status === 429) break;
     if (!dRes.ok) continue;
     const d = await dRes.json();
-    const flat = d.flatNbt || {};
-    let hex = '';
-    for (const k of ['color','Color','colour']) if (flat[k]) { hex = String(flat[k]); break; }
-    hex = hex.replace('#','').toUpperCase();
-    if (/^[0-9]{1,8}$/.test(hex)) hex = (parseInt(hex,10) >>> 0).toString(16).toUpperCase();
+    const flat = d.flatNbt || d.flatNBT || {};
+    let hex = '', uid = '';
+
+    // 1) colour straight off the flattened NBT, if present
+    for (const k of ['color','Color','colour','Colour']) {
+      if (flat[k] !== undefined && flat[k] !== null) { hex = String(flat[k]); break; }
+    }
+    for (const k of ['uid','uId','uuid','Uuid']) {
+      if (flat[k]) { uid = String(flat[k]); break; }
+    }
+
+    // 2) otherwise decode the raw item NBT ourselves
+    if (!hex) {
+      const bytes = d.itemBytes || d.item_bytes || d.nbtData || d.bytes ||
+                    (d.itemBytes && d.itemBytes.data) || '';
+      if (bytes && typeof bytes === 'string') {
+        const sey = await seymourFromBytes(bytes);
+        if (sey) { hex = sey.hex; if (!uid) uid = sey.uid || ''; }
+      }
+    }
+
+    hex = String(hex).replace('#','').trim().toUpperCase();
+    if (/^-?[0-9]{1,10}$/.test(hex)) hex = (parseInt(hex,10) >>> 0).toString(16).toUpperCase();
     hex = hex.padStart(6,'0').slice(-6);
-    if (!/^[0-9A-F]{6}$/.test(hex)) continue;
-    const uid   = String(flat.uid || flat.uId || '').replace(/-/g,'').slice(-12);
+    if (!/^[0-9A-F]{6}$/.test(hex)) { skippedNoColour++; continue; }
+    uid = uid.replace(/-/g,'').toLowerCase().slice(-12);
+
     const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
     await env.DB.prepare(
       `INSERT OR IGNORE INTO seymour_sales
@@ -116,7 +135,10 @@ async function backfillStep(env, budget) {
   await setMeta(env, 'bf_last_run', Date.now());
   await setMeta(env, 'bf_last_result', JSON.stringify(
     { at: Date.now(), tag, page, listed: list.length, newFetched: spent, stored,
-      oldest, note: spent === 0 ? 'page already fully archived' : 'ok' }));
+      skippedNoColour, oldest,
+      note: spent === 0 ? 'page already fully archived'
+          : skippedNoColour > 0 ? skippedNoColour + ' of ' + spent + ' had no readable colour'
+          : 'ok' }));
   return { ok: true, tag, page, stored, examined: list.length, oldest, budget };
 }
 
@@ -834,7 +856,7 @@ export default {
     if (url.pathname === '/seymour/backfill/status' && request.method === 'GET') {
       try {
         await ensureSales(env);
-        const enabled = (await getMeta(env, 'bf_enabled', '0')) === '1';
+        const enabled = true;
         const ti      = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
         const oldest  = parseInt(await getMeta(env, 'bf_oldest', '0'), 10) || 0;
         const page    = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
@@ -1225,4 +1247,3 @@ export default {
   },
 }
 ;
-
