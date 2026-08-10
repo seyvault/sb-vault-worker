@@ -893,6 +893,34 @@ export default {
       } catch (e) { return err('backfill error: ' + e.message, 500); }
     }
 
+
+    // ── Seymour: diagnostics ─────────────────────────────────────────
+    if (url.pathname === '/seymour/debug' && request.method === 'GET') {
+      const out = {};
+      try {
+        const cols = await env.DB.prepare(`PRAGMA table_info(seymour_sales)`).all();
+        out.sales_columns = (cols.results || []).map(c => c.name);
+        out.has_item_uid  = out.sales_columns.includes('item_uid');
+      } catch (e) { out.sales_columns = 'ERROR: ' + e.message; }
+      try {
+        const c = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
+        out.sales_rows = c ? c.c : 0;
+      } catch (e) { out.sales_rows = 'ERROR: ' + e.message; }
+      try {
+        const m = await env.DB.prepare(`SELECT k, v FROM seymour_meta`).all();
+        out.meta = Object.fromEntries((m.results || []).map(r => [r.k, r.v]));
+      } catch (e) { out.meta = 'ERROR: ' + e.message; }
+      try {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO seymour_sales
+           (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
+           VALUES ('__probe__','TEST','probeuid','FFFFFF',1,1,'','',0,'probe')`).run();
+        await env.DB.prepare(`DELETE FROM seymour_sales WHERE auction_uuid='__probe__'`).run();
+        out.insert_test = 'OK';
+      } catch (e) { out.insert_test = 'FAILED: ' + e.message; }
+      return json(out);
+    }
+
     // ── Seymour: sales history ───────────────────────────────────────
     if (url.pathname === '/seymour/sales' && request.method === 'GET') {
       try {
@@ -973,10 +1001,15 @@ export default {
         try { sets = JSON.parse(r.sets || '[]'); } catch(e) {}
         const cats = {};
         for (const p of pieces) cats[p.cat] = (cats[p.cat] || 0) + 1;
+        const tiers = { t0: 0, t1: 0, t2: 0 };
+        for (const p of pieces) {
+          const d = p.best && typeof p.best.dE === 'number' ? p.best.dE : 99;
+          if (d < 1) tiers.t0++; else if (d < 2) tiers.t1++; else if (d < 5) tiers.t2++;
+        }
         const slots = {};
         for (const p of pieces) slots[p.slot] = (slots[p.slot] || 0) + 1;
         return { uuid: r.uuid, ign: r.ign, discord: r.discord || '', count: pieces.length,
-                 sets: sets.length, cats, slots, updated_at: r.updated_at };
+                 sets: sets.length, cats, tiers, slots, updated_at: r.updated_at };
       });
       return json({ collections: out });
     }
