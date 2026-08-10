@@ -950,17 +950,25 @@ export default {
           if (r && r.name) out[u] = r.name; else missing.push(u);
         }
         for (const u of missing.slice(0, 12)) {
+          let name = null;
+          // 1) Mojang session server
           try {
             const res = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${u}`);
-            if (!res.ok) continue;
-            const p = await res.json();
-            if (p && p.name) {
-              out[u] = p.name;
-              await env.DB.prepare(
-                `INSERT OR REPLACE INTO mc_names (uuid,name,fetched_at) VALUES (?,?,?)`)
-                .bind(u, p.name, Date.now()).run();
-            }
+            if (res.ok) { const p = await res.json(); if (p && p.name) name = p.name; }
           } catch (e) {}
+          // 2) fallback: mc-heads (Mojang throttles shared Cloudflare IPs hard)
+          if (!name) {
+            try {
+              const res2 = await fetch(`https://mc-heads.net/minecraft/profile/${u}`);
+              if (res2.ok) { const p2 = await res2.json(); if (p2 && p2.name) name = p2.name; }
+            } catch (e) {}
+          }
+          if (name) {
+            out[u] = name;
+            await env.DB.prepare(
+              `INSERT OR REPLACE INTO mc_names (uuid,name,fetched_at) VALUES (?,?,?)`)
+              .bind(u, name, Date.now()).run();
+          }
         }
         return json({ names: out });
       } catch (e) { return err('names error: ' + e.message, 500); }
