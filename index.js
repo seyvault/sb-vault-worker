@@ -68,45 +68,53 @@ async function backfillStep(env, budget) {
   if (!Array.isArray(list) || list.length === 0) {
     await setMeta(env, 'bf_tag_index', ti + 1);
     await setMeta(env, 'bf_page', 0);
+    await setMeta(env, 'bf_offset', 0);
     await setMeta(env, 'bf_last_result', JSON.stringify(
       { at: Date.now(), tag, page, listed: 0, note: 'page empty -> moved to next piece' }));
     return { tagFinished: tag, next: BF_TAGS[ti + 1] || null };
   }
 
-  let stored = 0, spent = 0, oldest = null, skippedNoColour = 0;
+  let offset = parseInt(await getMeta(env, 'bf_offset', '0'), 10) || 0;
+  if (offset >= list.length) offset = 0;
+
+  let stored = 0, spent = 0, oldest = null, skippedNoColour = 0, alreadyHad = 0;
+
+  // Oldest end date on this page, regardless of what we manage to store.
   for (const a of list) {
     const end = Date.parse(a.end || '') || 0;
     if (end && (!oldest || end < oldest)) oldest = end;
+  }
+
+  // Walk forward from the saved offset. The cursor ALWAYS advances past
+  // whatever we looked at, so a run of failures can never stall the page.
+  let i = offset;
+  for (; i < list.length; i++) {
     if (spent >= budget) break;
+    const a = list[i];
     const seen = await env.DB.prepare(
       `SELECT 1 FROM seymour_sales WHERE auction_uuid = ?`).bind(a.uuid).first();
-    if (seen) continue;
+    if (seen) { alreadyHad++; continue; }
+
     spent++;
-    const dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`);
-    if (dRes.status === 429) break;
-    if (!dRes.ok) continue;
+    let dRes;
+    try { dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`); }
+    catch (e) { continue; }
+    if (dRes.status === 429) { i--; break; }          // back off, retry this one next tick
+    if (!dRes.ok) { skippedNoColour++; continue; }
     const d = await dRes.json();
     const flat = d.flatNbt || d.flatNBT || {};
     let hex = '', uid = '';
-
-    // 1) colour straight off the flattened NBT, if present
     for (const k of ['color','Color','colour','Colour']) {
       if (flat[k] !== undefined && flat[k] !== null) { hex = String(flat[k]); break; }
     }
-    for (const k of ['uid','uId','uuid','Uuid']) {
-      if (flat[k]) { uid = String(flat[k]); break; }
-    }
-
-    // 2) otherwise decode the raw item NBT ourselves
+    for (const k of ['uid','uId','uuid','Uuid']) { if (flat[k]) { uid = String(flat[k]); break; } }
     if (!hex) {
-      const bytes = d.itemBytes || d.item_bytes || d.nbtData || d.bytes ||
-                    (d.itemBytes && d.itemBytes.data) || '';
+      const bytes = d.itemBytes || d.item_bytes || d.nbtData || d.bytes || '';
       if (bytes && typeof bytes === 'string') {
         const sey = await seymourFromBytes(bytes);
         if (sey) { hex = sey.hex; if (!uid) uid = sey.uid || ''; }
       }
     }
-
     hex = String(hex).replace('#','').trim().toUpperCase();
     if (/^-?[0-9]{1,10}$/.test(hex)) hex = (parseInt(hex,10) >>> 0).toString(16).toUpperCase();
     hex = hex.padStart(6,'0').slice(-6);
@@ -122,20 +130,21 @@ async function backfillStep(env, budget) {
             d.bin ? 1 : 0, d.auctioneerId || '', buyer,
             Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
     stored++;
-    await new Promise(r => setTimeout(r, 500));   // 2 req/s peak, ~6s per tick so the invocation always finishes
+    await new Promise(r => setTimeout(r, 500));
   }
 
-  // Only advance the page once we've worked through everything new on it
-  if (spent < budget) await setMeta(env, 'bf_page', page + 1);
-
-  if (oldest) {
-    const prev = parseInt(await getMeta(env, 'bf_oldest', '0'), 10) || 0;
-    if (!prev || oldest < prev) await setMeta(env, 'bf_oldest', oldest);
+  // Advance: finished the page -> next page; otherwise remember where we got to.
+  if (i >= list.length) {
+    await setMeta(env, 'bf_page', page + 1);
+    await setMeta(env, 'bf_offset', 0);
+  } else {
+    await setMeta(env, 'bf_offset', i);
   }
+
   await setMeta(env, 'bf_last_run', Date.now());
   await setMeta(env, 'bf_last_result', JSON.stringify(
-    { at: Date.now(), tag, page, listed: list.length, newFetched: spent, stored,
-      skippedNoColour, oldest,
+    { at: Date.now(), tag, page, offset, nextOffset: i >= list.length ? 0 : i,
+      listed: list.length, newFetched: spent, stored, alreadyHad, skippedNoColour, oldest,
       note: spent === 0 ? 'page already fully archived'
           : skippedNoColour > 0 ? skippedNoColour + ' of ' + spent + ' had no readable colour'
           : 'ok' }));
@@ -868,6 +877,7 @@ export default {
         const ti      = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
         const oldest  = parseInt(await getMeta(env, 'bf_oldest', '0'), 10) || 0;
         const page    = parseInt(await getMeta(env, 'bf_page', '0'), 10) || 0;
+        const offset  = parseInt(await getMeta(env, 'bf_offset', '0'), 10) || 0;
         const last    = parseInt(await getMeta(env, 'bf_last_run', '0'), 10) || 0;
         const started = parseInt(await getMeta(env, 'tracking_started', '0'), 10) || 0;
         const lastRes = await getMeta(env, 'bf_last_result', 'null');
@@ -879,7 +889,7 @@ export default {
         const pct = Math.max(0, Math.min(100, ((now - reached) / span) * 100));
         return json({
           enabled, done: ti >= BF_TAGS.length,
-          tag: BF_TAGS[ti] || null, tagIndex: ti, tagCount: BF_TAGS.length, page,
+          tag: BF_TAGS[ti] || null, tagIndex: ti, tagCount: BF_TAGS.length, page, offset,
           oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
           percent: Math.round(pct * 10) / 10,
           totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
@@ -898,6 +908,7 @@ export default {
         if (b.reset) {
           await setMeta(env, 'bf_tag_index', 0);
           await setMeta(env, 'bf_page', 0);
+          await setMeta(env, 'bf_offset', 0);
           await setMeta(env, 'bf_oldest', 0);
         }
         if (b.budget !== undefined) {
