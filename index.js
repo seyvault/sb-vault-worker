@@ -48,7 +48,7 @@ async function setMeta(env, k, v) {
 async function backfillStep(env, budget) {
   await ensureSales(env);
   if (budget === undefined) {
-    budget = parseInt(await getMeta(env, 'bf_budget', '40'), 10) || 40;
+    budget = parseInt(await getMeta(env, 'bf_budget', '12'), 10) || 40;
   }
   budget = Math.min(Math.max(budget, 1), 45);   // 45 + 1 keeps us under the 50-subrequest cap
   
@@ -122,7 +122,7 @@ async function backfillStep(env, budget) {
             d.bin ? 1 : 0, d.auctioneerId || '', buyer,
             Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
     stored++;
-    await new Promise(r => setTimeout(r, 1000));  // exactly Coflnet's ~1 req/s guidance
+    await new Promise(r => setTimeout(r, 500));   // 2 req/s peak, ~6s per tick so the invocation always finishes
   }
 
   // Only advance the page once we've worked through everything new on it
@@ -240,7 +240,7 @@ async function coflBackfill(env, tag, page, pageSize) {
             d.bin ? 1 : 0, d.auctioneerId || '', buyer,
             Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
     stored++;
-    await new Promise(r => setTimeout(r, 700));   // ~1.4 req/s
+    await new Promise(r => setTimeout(r, 500));   // ~1.4 req/s
   }
   return { ok: true, tag, page, checked, stored, skipped };
 }
@@ -288,8 +288,16 @@ async function pollEndedAuctions(env) {
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      await pollEndedAuctions(env).catch(e => console.error('poll failed', e));
-      await backfillStep(env).catch(e => console.error('backfill failed', e));
+      try { await ensureSales(env); } catch (e) {}
+      try { await pollEndedAuctions(env); }
+      catch (e) { try { await setMeta(env, 'poll_error', String(e && e.message || e)); } catch (_) {} }
+      try {
+        const r = await backfillStep(env);
+        await setMeta(env, 'bf_error', '');
+        await setMeta(env, 'bf_tick', JSON.stringify({ at: Date.now(), r }).slice(0, 900));
+      } catch (e) {
+        try { await setMeta(env, 'bf_error', String(e && e.message || e)); } catch (_) {}
+      }
     })());
   },
 
@@ -875,7 +883,7 @@ export default {
           oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
           percent: Math.round(pct * 10) / 10,
           totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
-          budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+          budget: parseInt(await getMeta(env, 'bf_budget', '12'), 10),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })()
         });
       } catch (e) { return err('status error: ' + e.message, 500); }
@@ -893,12 +901,12 @@ export default {
           await setMeta(env, 'bf_oldest', 0);
         }
         if (b.budget !== undefined) {
-          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 40, 1), 45);
+          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 12, 1), 45);
           await setMeta(env, 'bf_budget', bud);
         }
         await setMeta(env, 'bf_enabled', b.enabled ? '1' : '0');
         return json({ ok: true, enabled: !!b.enabled,
-                      budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+                      budget: parseInt(await getMeta(env, 'bf_budget', '12'), 10),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })() });
       } catch (e) { return err('toggle error: ' + e.message, 500); }
     }
