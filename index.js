@@ -48,9 +48,9 @@ async function setMeta(env, k, v) {
 async function backfillStep(env, budget) {
   await ensureSales(env);
   if (budget === undefined) {
-    budget = parseInt(await getMeta(env, 'bf_budget', '12'), 10) || 40;
+    budget = parseInt(await getMeta(env, 'bf_budget', '40'), 10) || 40;
   }
-  budget = Math.min(Math.max(budget, 1), 45);   // 45 + 1 keeps us under the 50-subrequest cap
+  budget = Math.min(Math.max(budget, 1), 48);   // +1 list request stays under the 50-subrequest cap
   
 
   let ti   = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
@@ -131,7 +131,7 @@ async function backfillStep(env, budget) {
       .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
             d.bin ? 1 : 0, d.auctioneerId || '', buyer, soldAt, 'coflnet').run();
     stored++;
-    await new Promise(r => setTimeout(r, 500));
+    if (spent < budget && i + 1 < list.length) await new Promise(r => setTimeout(r, 350));
   }
 
   // Advance: finished the page -> next page; otherwise remember where we got to.
@@ -912,7 +912,7 @@ export default {
           oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
           percent: Math.round(pct * 10) / 10,
           totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
-          budget: parseInt(await getMeta(env, 'bf_budget', '12'), 10),
+          budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })()
         });
       } catch (e) { return err('status error: ' + e.message, 500); }
@@ -931,12 +931,12 @@ export default {
           await setMeta(env, 'bf_oldest', 0);
         }
         if (b.budget !== undefined) {
-          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 12, 1), 45);
+          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 40, 1), 48);
           await setMeta(env, 'bf_budget', bud);
         }
         await setMeta(env, 'bf_enabled', b.enabled ? '1' : '0');
         return json({ ok: true, enabled: !!b.enabled,
-                      budget: parseInt(await getMeta(env, 'bf_budget', '12'), 10),
+                      budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })() });
       } catch (e) { return err('toggle error: ' + e.message, 500); }
     }
@@ -1012,6 +1012,37 @@ export default {
       } catch (e) { return err('names error: ' + e.message, 500); }
     }
 
+
+    // ── Seymour: inspect one Coflnet auction (why is nothing storing?) ──
+    if (url.pathname === '/seymour/probe' && request.method === 'GET') {
+      const out = {};
+      try {
+        const tag = SEYMOUR_TAGS.has(url.searchParams.get('tag') || '')
+          ? url.searchParams.get('tag') : 'VELVET_TOP_HAT';
+        const page = parseInt(url.searchParams.get('page') || '0', 10) || 0;
+        const lr = await fetch(
+          `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=5`);
+        out.listStatus = lr.status;
+        if (!lr.ok) { out.listBody = (await lr.text()).slice(0, 300); return json(out); }
+        const list = await lr.json();
+        out.listedCount = Array.isArray(list) ? list.length : 0;
+        out.firstListItem = Array.isArray(list) && list[0] ? list[0] : null;
+        if (!out.listedCount) return json(out);
+        const dr = await fetch(`https://sky.coflnet.com/api/auction/${list[0].uuid}`);
+        out.detailStatus = dr.status;
+        if (!dr.ok) { out.detailBody = (await dr.text()).slice(0, 300); return json(out); }
+        const d = await dr.json();
+        out.detailKeys = Object.keys(d);
+        out.flatNbtKeys = d.flatNbt ? Object.keys(d.flatNbt) : null;
+        out.flatNbt = d.flatNbt || null;
+        out.end = d.end;
+        out.parsedEnd = Date.parse(d.end || '') || null;
+        out.hasItemBytes = !!(d.itemBytes || d.item_bytes || d.nbtData || d.bytes);
+        out.highestBidAmount = d.highestBidAmount;
+      } catch (e) { out.error = String(e && e.message || e); }
+      return json(out);
+    }
+
     // ── Seymour: diagnostics ─────────────────────────────────────────
     if (url.pathname === '/seymour/debug' && request.method === 'GET') {
       const out = {};
@@ -1027,6 +1058,11 @@ export default {
       try {
         const m = await env.DB.prepare(`SELECT k, v FROM seymour_meta`).all();
         out.meta = Object.fromEntries((m.results || []).map(r => [r.k, r.v]));
+        if (out.meta.bf_last_result) {
+          try { out.lastSlice = JSON.parse(out.meta.bf_last_result); } catch (e) {}
+        }
+        out.cursor = { tag: BF_TAGS[parseInt(out.meta.bf_tag_index || '0', 10)] || null,
+                       page: out.meta.bf_page || '0', offset: out.meta.bf_offset || '0' };
       } catch (e) { out.meta = 'ERROR: ' + e.message; }
       try {
         await env.DB.prepare(
