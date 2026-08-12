@@ -77,7 +77,7 @@ async function backfillStep(env, budget) {
   let offset = parseInt(await getMeta(env, 'bf_offset', '0'), 10) || 0;
   if (offset >= list.length) offset = 0;
 
-  let stored = 0, spent = 0, oldest = null, skippedNoColour = 0, alreadyHad = 0;
+  let stored = 0, spent = 0, oldest = null, skippedNoColour = 0, alreadyHad = 0, skippedNoDate = 0;
 
   // Oldest end date on this page, regardless of what we manage to store.
   for (const a of list) {
@@ -122,13 +122,14 @@ async function backfillStep(env, budget) {
     uid = uid.replace(/-/g,'').toLowerCase().slice(-12);
 
     const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
+    const soldAt = Date.parse(d.end || '') || Date.parse(a.end || '') || 0;
+    if (!soldAt) { skippedNoDate++; continue; }   // real sale date or nothing
     await env.DB.prepare(
       `INSERT OR IGNORE INTO seymour_sales
        (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
        VALUES (?,?,?,?,?,?,?,?,?,?)`)
       .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
-            d.bin ? 1 : 0, d.auctioneerId || '', buyer,
-            Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
+            d.bin ? 1 : 0, d.auctioneerId || '', buyer, soldAt, 'coflnet').run();
     stored++;
     await new Promise(r => setTimeout(r, 500));
   }
@@ -144,7 +145,7 @@ async function backfillStep(env, budget) {
   await setMeta(env, 'bf_last_run', Date.now());
   await setMeta(env, 'bf_last_result', JSON.stringify(
     { at: Date.now(), tag, page, offset, nextOffset: i >= list.length ? 0 : i,
-      listed: list.length, newFetched: spent, stored, alreadyHad, skippedNoColour, oldest,
+      listed: list.length, newFetched: spent, stored, alreadyHad, skippedNoColour, skippedNoDate, oldest,
       note: spent === 0 ? 'page already fully archived'
           : skippedNoColour > 0 ? skippedNoColour + ' of ' + spent + ' had no readable colour'
           : 'ok' }));
@@ -241,13 +242,14 @@ async function coflBackfill(env, tag, page, pageSize) {
     if (!/^[0-9A-F]{6}$/.test(hex)) continue;
     const uid = String(flat.uid || flat.uId || '').replace(/-/g,'').slice(-12);
     const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
+    const soldAt = Date.parse(d.end || '') || Date.parse(a.end || '') || 0;
+    if (!soldAt) { skippedNoDate++; continue; }   // real sale date or nothing
     await env.DB.prepare(
       `INSERT OR IGNORE INTO seymour_sales
        (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
        VALUES (?,?,?,?,?,?,?,?,?,?)`)
       .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
-            d.bin ? 1 : 0, d.auctioneerId || '', buyer,
-            Date.parse(d.end || a.end) || Date.now(), 'coflnet').run();
+            d.bin ? 1 : 0, d.auctioneerId || '', buyer, soldAt, 'coflnet').run();
     stored++;
     await new Promise(r => setTimeout(r, 500));   // ~1.4 req/s
   }
@@ -868,6 +870,23 @@ export default {
       } catch (e) { return err('item error: ' + e.message, 500); }
     }
 
+
+
+    // ── Seymour: wipe the sales archive and restart the walk ─────────
+    if (url.pathname === '/seymour/sales/reset' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await ensureSales(env);
+        await env.DB.prepare(`DELETE FROM seymour_sales`).run();
+        for (const k of ['bf_page','bf_offset','bf_tag_index','bf_oldest',
+                         'bf_last_result','bf_error','bf_tick','poll_error']) {
+          await setMeta(env, k, k === 'bf_last_result' ? 'null' : '0');
+        }
+        await setMeta(env, 'tracking_started', String(Date.now()));
+        return json({ ok: true, reset: true });
+      } catch (e) { return err('reset error: ' + e.message, 500); }
+    }
 
     // ── Seymour: backfill control + progress ─────────────────────────
     if (url.pathname === '/seymour/backfill/status' && request.method === 'GET') {
