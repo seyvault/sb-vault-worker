@@ -307,13 +307,9 @@ export default {
       try { await ensureSales(env); } catch (e) {}
       try { await pollEndedAuctions(env); }
       catch (e) { try { await setMeta(env, 'poll_error', String(e && e.message || e)); } catch (_) {} }
-      try {
-        const r = await backfillStep(env);
-        await setMeta(env, 'bf_error', '');
-        await setMeta(env, 'bf_tick', JSON.stringify({ at: Date.now(), r }).slice(0, 900));
-      } catch (e) {
-        try { await setMeta(env, 'bf_error', String(e && e.message || e)); } catch (_) {}
-      }
+      // Server-side backfill is disabled: SkyCofl rate-limit Cloudflare's
+      // shared egress IPs. History is collected by the browser instead
+      // (see /seymour/sales/ingest), which uses the user's own IP.
     })());
   },
 
@@ -893,6 +889,112 @@ export default {
       } catch (e) { return err('reset error: ' + e.message, 500); }
     }
 
+
+
+    // ── Seymour: accept sales scraped by the user's own browser ──────
+    // The worker's shared Cloudflare IP is rate-limited by SkyCofl, but the
+    // user's home IP is not. The browser fetches, the worker just stores.
+    if (url.pathname === '/seymour/sales/ingest' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await ensureSales(env);
+        const body = await request.json();
+        const rows = Array.isArray(body.sales) ? body.sales.slice(0, 500) : [];
+        let stored = 0, bad = 0;
+        for (const r of rows) {
+          const uuid = String(r.auction_uuid || '').slice(0, 64);
+          let hex = String(r.hex || '').replace('#', '').toUpperCase();
+          if (/^-?[0-9]{1,10}$/.test(hex)) hex = (parseInt(hex, 10) >>> 0).toString(16).toUpperCase();
+          hex = hex.padStart(6, '0').slice(-6);
+          const soldAt = parseInt(r.sold_at, 10) || 0;
+          if (!uuid || !/^[0-9A-F]{6}$/.test(hex) || !soldAt || !SEYMOUR_TAGS.has(r.item_id)) { bad++; continue; }
+          try {
+            await env.DB.prepare(
+              `INSERT OR IGNORE INTO seymour_sales
+               (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
+               VALUES (?,?,?,?,?,?,?,?,?,?)`)
+              .bind(uuid, r.item_id, String(r.item_uid || '').slice(-12),
+                    hex, parseInt(r.price, 10) || 0, r.bin ? 1 : 0,
+                    String(r.seller || ''), String(r.buyer || ''), soldAt, 'browser').run();
+            stored++;
+          } catch (e) { bad++; }
+        }
+        if (stored) await setMeta(env, 'bf_last_run', Date.now());
+        const tot = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
+        return json({ ok: true, stored, bad, total: tot ? tot.c : 0 });
+      } catch (e) { return err('ingest error: ' + e.message, 500); }
+    }
+
+    // ── Seymour: claim the next page to scrape (multi-browser safe) ──
+    if (url.pathname === '/seymour/sales/claim' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await ensureSales(env);
+
+        let ti   = parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0;
+        let page = parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0;
+
+        // Release claims older than 4 minutes (browser closed mid-page).
+        let claims = {};
+        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
+        const now = Date.now();
+        for (const k of Object.keys(claims)) if (now - claims[k].at > 240000) delete claims[k];
+
+        // Find the first page nobody else is working on.
+        let guard = 0;
+        while (claims[ti + ':' + page] && guard++ < 200) {
+          page++;
+          if (page > 400) { page = 0; ti = (ti + 1) % BF_TAGS.length; }
+        }
+
+        claims[ti + ':' + page] = { at: now, by: session.uuid };
+        await setMeta(env, 'ui_claims', JSON.stringify(claims).slice(0, 4000));
+        await setMeta(env, 'ui_tag_index', ti);
+        await setMeta(env, 'ui_page', page);
+
+        return json({ tagIndex: ti, tag: BF_TAGS[ti], page,
+                      workers: Object.keys(claims).length });
+      } catch (e) { return err('claim error: ' + e.message, 500); }
+    }
+
+    // ── Seymour: report a page finished ──────────────────────────────
+    if (url.pathname === '/seymour/sales/done' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        const b = await request.json().catch(() => ({}));
+        const ti = parseInt(b.tagIndex, 10) || 0, page = parseInt(b.page, 10) || 0;
+        let claims = {};
+        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
+        delete claims[ti + ':' + page];
+        await setMeta(env, 'ui_claims', JSON.stringify(claims).slice(0, 4000));
+        if (b.empty) {                          // tag exhausted -> advance
+          const cur = parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0;
+          if (cur === ti) { await setMeta(env, 'ui_tag_index', (ti + 1) % BF_TAGS.length);
+                            await setMeta(env, 'ui_page', 0); }
+        } else {
+          const curPage = parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0;
+          if (page >= curPage) await setMeta(env, 'ui_page', page + 1);
+        }
+        return json({ ok: true });
+      } catch (e) { return err('done error: ' + e.message, 500); }
+    }
+
+    // ── Seymour: how many browsers are helping right now ─────────────
+    if (url.pathname === '/seymour/sales/helpers' && request.method === 'GET') {
+      try {
+        let claims = {};
+        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
+        const now = Date.now();
+        const live = Object.values(claims).filter(c => now - c.at < 240000);
+        return json({ helpers: new Set(live.map(c => c.by)).size,
+                      pages: live.length,
+                      tagIndex: parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0,
+                      page: parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0 });
+      } catch (e) { return json({ helpers: 0, pages: 0 }); }
+    }
 
     // ── Seymour: clear the Coflnet cooldown manually ─────────────────
     if (url.pathname === '/seymour/backfill/unblock' && request.method === 'POST') {
