@@ -78,6 +78,7 @@ async function backfillStep(env, budget) {
   if (offset >= list.length) offset = 0;
 
   let stored = 0, spent = 0, oldest = null, skippedNoColour = 0, alreadyHad = 0, skippedNoDate = 0;
+  let sampleSaved = false;
 
   // Oldest end date on this page, regardless of what we manage to store.
   for (const a of list) {
@@ -103,23 +104,46 @@ async function backfillStep(env, budget) {
     if (!dRes.ok) { skippedNoColour++; continue; }
     const d = await dRes.json();
     const flat = d.flatNbt || d.flatNBT || {};
-    let hex = '', uid = '';
+    let hex = '', uid = '', how = '';
+
     for (const k of ['color','Color','colour','Colour']) {
-      if (flat[k] !== undefined && flat[k] !== null) { hex = String(flat[k]); break; }
+      if (flat[k] !== undefined && flat[k] !== null) { hex = String(flat[k]); how = 'flatNbt.' + k; break; }
+    }
+    // some responses nest it under the item's own NBT display tag
+    if (!hex && d.nbtData && d.nbtData.data) {
+      const disp = d.nbtData.data.display || d.nbtData.data.Display;
+      if (disp && (disp.color !== undefined)) { hex = String(disp.color); how = 'nbtData.display.color'; }
     }
     for (const k of ['uid','uId','uuid','Uuid']) { if (flat[k]) { uid = String(flat[k]); break; } }
+
     if (!hex) {
-      const bytes = d.itemBytes || d.item_bytes || d.nbtData || d.bytes || '';
+      const bytes = d.itemBytes || d.item_bytes || d.bytes ||
+                    (d.itemBytes && d.itemBytes.data) || '';
       if (bytes && typeof bytes === 'string') {
         const sey = await seymourFromBytes(bytes);
-        if (sey) { hex = sey.hex; if (!uid) uid = sey.uid || ''; }
+        if (sey) { hex = sey.hex; how = 'itemBytes'; if (!uid) uid = sey.uid || ''; }
       }
     }
+
+    if (!hex) {
+      skippedNoColour++;
+      // keep one real example so we can see what the response actually looks like
+      if (!sampleSaved) {
+        sampleSaved = true;
+        await setMeta(env, 'bf_sample', JSON.stringify({
+          uuid: a.uuid, topKeys: Object.keys(d).slice(0, 30),
+          flatNbtKeys: d.flatNbt ? Object.keys(d.flatNbt).slice(0, 30) : null,
+          flatNbtSample: d.flatNbt || null, end: d.end
+        }).slice(0, 1500));
+      }
+      continue;
+    }
+
     hex = String(hex).replace('#','').trim().toUpperCase();
-    if (/^-?[0-9]{1,10}$/.test(hex)) hex = (parseInt(hex,10) >>> 0).toString(16).toUpperCase();
-    hex = hex.padStart(6,'0').slice(-6);
+    if (/^-?[0-9]{1,10}$/.test(hex)) hex = (parseInt(hex, 10) >>> 0).toString(16).toUpperCase();
+    hex = hex.padStart(6, '0').slice(-6);
     if (!/^[0-9A-F]{6}$/.test(hex)) { skippedNoColour++; continue; }
-    uid = uid.replace(/-/g,'').toLowerCase().slice(-12);
+    uid = uid.replace(/-/g, '').toLowerCase().slice(-12);
 
     const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
     const soldAt = Date.parse(d.end || '') || Date.parse(a.end || '') || 0;
@@ -215,46 +239,7 @@ async function seymourFromBytes(itemBytes) {
 }
 
 
-// Backfill historic Seymour sales from Coflnet (they store colour + uId).
-// Rate limits: 30 req / 10s, 100 req / min -> we stay well under.
-async function coflBackfill(env, tag, page, pageSize) {
-  await ensureSales(env);
-  const listRes = await fetch(
-    `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=${pageSize}`);
-  if (!listRes.ok) return { ok: false, status: listRes.status, stage: 'list' };
-  const list = await listRes.json();
-  let stored = 0, checked = 0, skipped = 0;
-  for (const a of (list || [])) {
-    checked++;
-    const exists = await env.DB.prepare(
-      `SELECT 1 FROM seymour_sales WHERE auction_uuid = ?`).bind(a.uuid).first();
-    if (exists) { skipped++; continue; }
-    const dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`);
-    if (!dRes.ok) continue;
-    const d = await dRes.json();
-    const flat = d.flatNbt || {};
-    let hex = '';
-    for (const k of ['color','Color','colour']) {
-      if (flat[k]) { hex = String(flat[k]).replace('#','').toUpperCase(); break; }
-    }
-    if (/^\d{1,8}$/.test(hex)) hex = (parseInt(hex,10)>>>0).toString(16).toUpperCase();
-    hex = hex.padStart(6,'0').slice(-6);
-    if (!/^[0-9A-F]{6}$/.test(hex)) continue;
-    const uid = String(flat.uid || flat.uId || '').replace(/-/g,'').slice(-12);
-    const buyer = (d.bids && d.bids.length) ? d.bids[d.bids.length-1].bidder : '';
-    const soldAt = Date.parse(d.end || '') || Date.parse(a.end || '') || 0;
-    if (!soldAt) { skippedNoDate++; continue; }   // real sale date or nothing
-    await env.DB.prepare(
-      `INSERT OR IGNORE INTO seymour_sales
-       (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
-            d.bin ? 1 : 0, d.auctioneerId || '', buyer, soldAt, 'coflnet').run();
-    stored++;
-    await new Promise(r => setTimeout(r, 500));   // ~1.4 req/s
-  }
-  return { ok: true, tag, page, checked, stored, skipped };
-}
+
 
 async function ensureSales(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_sales (
@@ -950,18 +935,6 @@ export default {
       } catch (e) { return err('step error: ' + e.message, 500); }
     }
 
-    // ── Seymour: Coflnet backfill ────────────────────────────────────
-    if (url.pathname === '/seymour/backfill' && request.method === 'POST') {
-      try {
-        const b = await request.json().catch(() => ({}));
-        const tag = SEYMOUR_TAGS.has(b.tag) ? b.tag : 'VELVET_TOP_HAT';
-        const page = Math.max(0, parseInt(b.page || 0, 10) || 0);
-        const size = Math.min(Math.max(parseInt(b.pageSize || 20, 10) || 20, 1), 60);
-        return json(await coflBackfill(env, tag, page, size));
-      } catch (e) { return err('backfill error: ' + e.message, 500); }
-    }
-
-
 
     // ── Seymour: cheap change-poll for live UI ───────────────────────
     if (url.pathname === '/seymour/version' && request.method === 'GET') {
@@ -987,18 +960,27 @@ export default {
           const r = await env.DB.prepare(`SELECT name FROM mc_names WHERE uuid = ?`).bind(u).first();
           if (r && r.name) out[u] = r.name; else missing.push(u);
         }
-        for (const u of missing.slice(0, 12)) {
+        let lastErr = null;
+        for (const u of missing.slice(0, 10)) {
           let name = null;
-          // 1) Mojang session server
           try {
-            const res = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${u}`);
+            const res = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${u}`,
+              { headers: { 'User-Agent': 'seyvault' } });
             if (res.ok) { const p = await res.json(); if (p && p.name) name = p.name; }
-          } catch (e) {}
-          // 2) fallback: mc-heads (Mojang throttles shared Cloudflare IPs hard)
+            else lastErr = 'mojang ' + res.status;
+          } catch (e) { lastErr = 'mojang ' + (e.message || e); }
           if (!name) {
             try {
-              const res2 = await fetch(`https://mc-heads.net/minecraft/profile/${u}`);
-              if (res2.ok) { const p2 = await res2.json(); if (p2 && p2.name) name = p2.name; }
+              const r2 = await fetch(`https://api.ashcon.app/mojang/v2/user/${u}`);
+              if (r2.ok) { const p2 = await r2.json(); if (p2 && p2.username) name = p2.username; }
+              else if (!lastErr) lastErr = 'ashcon ' + r2.status;
+            } catch (e) { if (!lastErr) lastErr = 'ashcon ' + (e.message || e); }
+          }
+          if (!name) {
+            try {
+              const r3 = await fetch(`https://playerdb.co/api/player/minecraft/${u}`);
+              if (r3.ok) { const p3 = await r3.json();
+                if (p3 && p3.data && p3.data.player && p3.data.player.username) name = p3.data.player.username; }
             } catch (e) {}
           }
           if (name) {
@@ -1008,12 +990,11 @@ export default {
               .bind(u, name, Date.now()).run();
           }
         }
-        return json({ names: out });
+        return json({ names: out, error: lastErr, asked: raw.length, missing: missing.length });
       } catch (e) { return err('names error: ' + e.message, 500); }
     }
 
-
-    // ── Seymour: inspect one Coflnet auction (why is nothing storing?) ──
+    // ── Seymour: inspect one Coflnet auction ─────────────────────────
     if (url.pathname === '/seymour/probe' && request.method === 'GET') {
       const out = {};
       try {
@@ -1023,22 +1004,21 @@ export default {
         const lr = await fetch(
           `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=5`);
         out.listStatus = lr.status;
-        if (!lr.ok) { out.listBody = (await lr.text()).slice(0, 300); return json(out); }
+        if (!lr.ok) { out.listBody = (await lr.text()).slice(0, 400); return json(out); }
         const list = await lr.json();
         out.listedCount = Array.isArray(list) ? list.length : 0;
         out.firstListItem = Array.isArray(list) && list[0] ? list[0] : null;
         if (!out.listedCount) return json(out);
         const dr = await fetch(`https://sky.coflnet.com/api/auction/${list[0].uuid}`);
         out.detailStatus = dr.status;
-        if (!dr.ok) { out.detailBody = (await dr.text()).slice(0, 300); return json(out); }
+        if (!dr.ok) { out.detailBody = (await dr.text()).slice(0, 400); return json(out); }
         const d = await dr.json();
         out.detailKeys = Object.keys(d);
         out.flatNbtKeys = d.flatNbt ? Object.keys(d.flatNbt) : null;
         out.flatNbt = d.flatNbt || null;
         out.end = d.end;
         out.parsedEnd = Date.parse(d.end || '') || null;
-        out.hasItemBytes = !!(d.itemBytes || d.item_bytes || d.nbtData || d.bytes);
-        out.highestBidAmount = d.highestBidAmount;
+        out.hasItemBytes = !!(d.itemBytes || d.item_bytes || d.bytes);
       } catch (e) { out.error = String(e && e.message || e); }
       return json(out);
     }
@@ -1049,29 +1029,24 @@ export default {
       try {
         const cols = await env.DB.prepare(`PRAGMA table_info(seymour_sales)`).all();
         out.sales_columns = (cols.results || []).map(c => c.name);
-        out.has_item_uid  = out.sales_columns.includes('item_uid');
+        out.has_item_uid = out.sales_columns.includes('item_uid');
       } catch (e) { out.sales_columns = 'ERROR: ' + e.message; }
       try {
-        const c = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
+        const c = await env.DB.prepare(
+          `SELECT COUNT(*) AS c, SUM(source='coflnet') AS cofl, SUM(source='hypixel') AS hyp
+             FROM seymour_sales`).first();
         out.sales_rows = c ? c.c : 0;
+        out.from_coflnet = c ? c.cofl : 0;
+        out.from_hypixel = c ? c.hyp : 0;
       } catch (e) { out.sales_rows = 'ERROR: ' + e.message; }
       try {
         const m = await env.DB.prepare(`SELECT k, v FROM seymour_meta`).all();
         out.meta = Object.fromEntries((m.results || []).map(r => [r.k, r.v]));
-        if (out.meta.bf_last_result) {
-          try { out.lastSlice = JSON.parse(out.meta.bf_last_result); } catch (e) {}
-        }
+        if (out.meta.bf_last_result) { try { out.lastSlice = JSON.parse(out.meta.bf_last_result); } catch (e) {} }
+        if (out.meta.bf_sample)      { try { out.sample    = JSON.parse(out.meta.bf_sample); } catch (e) {} }
         out.cursor = { tag: BF_TAGS[parseInt(out.meta.bf_tag_index || '0', 10)] || null,
                        page: out.meta.bf_page || '0', offset: out.meta.bf_offset || '0' };
       } catch (e) { out.meta = 'ERROR: ' + e.message; }
-      try {
-        await env.DB.prepare(
-          `INSERT OR IGNORE INTO seymour_sales
-           (auction_uuid,item_id,item_uid,hex,price,bin,seller,buyer,sold_at,source)
-           VALUES ('__probe__','TEST','probeuid','FFFFFF',1,1,'','',0,'probe')`).run();
-        await env.DB.prepare(`DELETE FROM seymour_sales WHERE auction_uuid='__probe__'`).run();
-        out.insert_test = 'OK';
-      } catch (e) { out.insert_test = 'FAILED: ' + e.message; }
       return json(out);
     }
 
