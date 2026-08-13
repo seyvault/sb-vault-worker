@@ -48,9 +48,9 @@ async function setMeta(env, k, v) {
 async function backfillStep(env, budget) {
   await ensureSales(env);
   if (budget === undefined) {
-    budget = parseInt(await getMeta(env, 'bf_budget', '40'), 10) || 40;
+    budget = parseInt(await getMeta(env, 'bf_budget', '6'), 10) || 40;
   }
-  budget = Math.min(Math.max(budget, 1), 48);   // +1 list request stays under the 50-subrequest cap
+  budget = Math.min(Math.max(budget, 1), 20);   // +1 list request stays under the 50-subrequest cap
   
 
   let ti   = parseInt(await getMeta(env, 'bf_tag_index', '0'), 10) || 0;
@@ -58,9 +58,24 @@ async function backfillStep(env, budget) {
   if (ti >= BF_TAGS.length) return { done: true };
   const tag = BF_TAGS[ti];
 
+  // Honour a cooldown: if Coflnet blocked us, do not touch them again until it expires.
+  const blockedUntil = parseInt(await getMeta(env, 'cofl_blocked_until', '0'), 10) || 0;
+  if (blockedUntil > Date.now()) {
+    return { blocked: true, until: blockedUntil,
+             retryInMin: Math.ceil((blockedUntil - Date.now()) / 60000) };
+  }
+
   const listRes = await fetch(
     `https://sky.coflnet.com/api/auctions/tag/${tag}/sold?page=${page}&pageSize=100`);
-  if (listRes.status === 429) return { rateLimited: true, tag, page };
+
+  if (listRes.status === 403 || listRes.status === 429) {
+    const body = await listRes.text().catch(() => '');
+    // 403 = IP ban. Back off hard (6h) so we stop making it worse.
+    const cool = listRes.status === 403 ? 6 * 3600e3 : 15 * 60e3;
+    await setMeta(env, 'cofl_blocked_until', Date.now() + cool);
+    await setMeta(env, 'cofl_block_reason', (body || String(listRes.status)).slice(0, 400));
+    return { blocked: true, status: listRes.status, cooldownMs: cool };
+  }
   if (!listRes.ok) return { ok: false, status: listRes.status, tag, page };
   const list = await listRes.json();
 
@@ -100,6 +115,11 @@ async function backfillStep(env, budget) {
     let dRes;
     try { dRes = await fetch(`https://sky.coflnet.com/api/auction/${a.uuid}`); }
     catch (e) { continue; }
+    if (dRes.status === 403) {
+      await setMeta(env, 'cofl_blocked_until', Date.now() + 6 * 3600e3);
+      await setMeta(env, 'cofl_block_reason', 'detail 403');
+      i--; break;
+    }
     if (dRes.status === 429) { i--; break; }          // back off, retry this one next tick
     if (!dRes.ok) { skippedNoColour++; continue; }
     const d = await dRes.json();
@@ -155,7 +175,7 @@ async function backfillStep(env, budget) {
       .bind(a.uuid, tag, uid, hex, d.highestBidAmount || a.highestBidAmount || 0,
             d.bin ? 1 : 0, d.auctioneerId || '', buyer, soldAt, 'coflnet').run();
     stored++;
-    if (spent < budget && i + 1 < list.length) await new Promise(r => setTimeout(r, 350));
+    if (spent < budget && i + 1 < list.length) await new Promise(r => setTimeout(r, 1200));
   }
 
   // Advance: finished the page -> next page; otherwise remember where we got to.
@@ -873,6 +893,18 @@ export default {
       } catch (e) { return err('reset error: ' + e.message, 500); }
     }
 
+
+    // ── Seymour: clear the Coflnet cooldown manually ─────────────────
+    if (url.pathname === '/seymour/backfill/unblock' && request.method === 'POST') {
+      try {
+        const session = await getSession(request, env);
+        if (!session || !session.uuid) return err('Unauthorised', 401);
+        await setMeta(env, 'cofl_blocked_until', '0');
+        await setMeta(env, 'cofl_block_reason', '');
+        return json({ ok: true });
+      } catch (e) { return err('unblock error: ' + e.message, 500); }
+    }
+
     // ── Seymour: backfill control + progress ─────────────────────────
     if (url.pathname === '/seymour/backfill/status' && request.method === 'GET') {
       try {
@@ -897,7 +929,9 @@ export default {
           oldestReached: reached, releaseDate: SEYMOUR_RELEASE,
           percent: Math.round(pct * 10) / 10,
           totalSales: row ? row.c : 0, lastRun: last, trackingStarted: started,
-          budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+          budget: parseInt(await getMeta(env, 'bf_budget', '6'), 10),
+          blockedUntil: parseInt(await getMeta(env, 'cofl_blocked_until', '0'), 10) || 0,
+          blockReason: await getMeta(env, 'cofl_block_reason', ''),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })()
         });
       } catch (e) { return err('status error: ' + e.message, 500); }
@@ -916,12 +950,14 @@ export default {
           await setMeta(env, 'bf_oldest', 0);
         }
         if (b.budget !== undefined) {
-          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 40, 1), 48);
+          const bud = Math.min(Math.max(parseInt(b.budget, 10) || 6, 1), 48);
           await setMeta(env, 'bf_budget', bud);
         }
         await setMeta(env, 'bf_enabled', b.enabled ? '1' : '0');
         return json({ ok: true, enabled: !!b.enabled,
-                      budget: parseInt(await getMeta(env, 'bf_budget', '40'), 10),
+                      budget: parseInt(await getMeta(env, 'bf_budget', '6'), 10),
+          blockedUntil: parseInt(await getMeta(env, 'cofl_blocked_until', '0'), 10) || 0,
+          blockReason: await getMeta(env, 'cofl_block_reason', ''),
           lastResult: (() => { try { return JSON.parse(lastRes); } catch (e) { return null; } })() });
       } catch (e) { return err('toggle error: ' + e.message, 500); }
     }
