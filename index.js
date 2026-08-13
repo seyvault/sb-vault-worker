@@ -960,74 +960,92 @@ export default {
       } catch (e) { return err('leaderboard error: ' + e.message, 500); }
     }
 
-    // ── Seymour: claim the next page to scrape (multi-browser safe) ──
-    if (url.pathname === '/seymour/sales/claim' && request.method === 'POST') {
+    // ── Seymour: claim a DAY to scan (multi-browser safe) ────────────
+    // Days are stable and monotonic, unlike page numbers. Each browser gets
+    // its own UTC day, walking backwards from today. Nobody overlaps.
+    if (url.pathname === '/seymour/day/claim' && request.method === 'POST') {
       try {
         const session = await getSession(request, env);
         if (!session || !session.uuid) return err('Unauthorised', 401);
         await ensureSales(env);
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_days (
+          day TEXT PRIMARY KEY,          -- YYYY-MM-DD (UTC)
+          state TEXT,                    -- 'claimed' | 'done'
+          owner TEXT, claimed_at INTEGER, done_at INTEGER, found INTEGER DEFAULT 0
+        )`).run();
 
-        let ti   = parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0;
-        let page = parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0;
-
-        // Release claims older than 4 minutes (browser closed mid-page).
-        let claims = {};
-        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
+        const DAY = 86400000;
+        const todayUTC = Math.floor(Date.now() / DAY) * DAY;
+        const oldest = Date.parse('2023-02-01T00:00:00Z');
         const now = Date.now();
-        for (const k of Object.keys(claims)) if (now - claims[k].at > 240000) delete claims[k];
 
-        // Find the first page nobody else is working on.
-        let guard = 0;
-        while (claims[ti + ':' + page] && guard++ < 200) {
-          page++;
-          if (page > 400) { page = 0; ti = (ti + 1) % BF_TAGS.length; }
+        // Expire stale claims (browser closed) so the day is offered again.
+        await env.DB.prepare(
+          `UPDATE seymour_days SET state='free', owner=NULL
+            WHERE state='claimed' AND claimed_at < ?`).bind(now - 300000).run();
+
+        // Already holding one? Keep it - avoids losing work on a refresh.
+        const held = await env.DB.prepare(
+          `SELECT day FROM seymour_days WHERE owner=? AND state='claimed' LIMIT 1`)
+          .bind(session.uuid).first();
+        if (held) {
+          const t = Date.parse(held.day + 'T00:00:00Z');
+          return json({ day: held.day, from: t, to: t + DAY - 1, resumed: true });
         }
 
-        claims[ti + ':' + page] = { at: now, by: session.uuid };
-        await setMeta(env, 'ui_claims', JSON.stringify(claims).slice(0, 4000));
-        await setMeta(env, 'ui_tag_index', ti);
-        await setMeta(env, 'ui_page', page);
-
-        return json({ tagIndex: ti, tag: BF_TAGS[ti], page,
-                      workers: Object.keys(claims).length });
-      } catch (e) { return err('claim error: ' + e.message, 500); }
+        // Walk backwards from today for the first day nobody has taken.
+        for (let t = todayUTC; t >= oldest; t -= DAY) {
+          const day = new Date(t).toISOString().slice(0, 10);
+          const row = await env.DB.prepare(
+            `SELECT state FROM seymour_days WHERE day=?`).bind(day).first();
+          if (row && (row.state === 'done' || row.state === 'claimed')) continue;
+          await env.DB.prepare(
+            `INSERT INTO seymour_days (day,state,owner,claimed_at)
+             VALUES (?,'claimed',?,?)
+             ON CONFLICT(day) DO UPDATE SET state='claimed', owner=excluded.owner,
+               claimed_at=excluded.claimed_at`).bind(day, session.uuid, now).run();
+          return json({ day, from: t, to: t + DAY - 1 });
+        }
+        return json({ complete: true });
+      } catch (e) { return err('day claim error: ' + e.message, 500); }
     }
 
-    // ── Seymour: report a page finished ──────────────────────────────
-    if (url.pathname === '/seymour/sales/done' && request.method === 'POST') {
+    // ── Seymour: mark a day finished ─────────────────────────────────
+    if (url.pathname === '/seymour/day/done' && request.method === 'POST') {
       try {
         const session = await getSession(request, env);
         if (!session || !session.uuid) return err('Unauthorised', 401);
         const b = await request.json().catch(() => ({}));
-        const ti = parseInt(b.tagIndex, 10) || 0, page = parseInt(b.page, 10) || 0;
-        let claims = {};
-        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
-        delete claims[ti + ':' + page];
-        await setMeta(env, 'ui_claims', JSON.stringify(claims).slice(0, 4000));
-        if (b.empty) {                          // tag exhausted -> advance
-          const cur = parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0;
-          if (cur === ti) { await setMeta(env, 'ui_tag_index', (ti + 1) % BF_TAGS.length);
-                            await setMeta(env, 'ui_page', 0); }
-        } else {
-          const curPage = parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0;
-          if (page >= curPage) await setMeta(env, 'ui_page', page + 1);
-        }
+        if (!b.day) return err('day required');
+        await env.DB.prepare(
+          `UPDATE seymour_days SET state='done', done_at=?, found=COALESCE(found,0)+?
+            WHERE day=?`).bind(Date.now(), parseInt(b.found, 10) || 0, b.day).run();
         return json({ ok: true });
-      } catch (e) { return err('done error: ' + e.message, 500); }
+      } catch (e) { return err('day done error: ' + e.message, 500); }
     }
 
-    // ── Seymour: how many browsers are helping right now ─────────────
-    if (url.pathname === '/seymour/sales/helpers' && request.method === 'GET') {
+    // ── Seymour: overall day-coverage progress ───────────────────────
+    if (url.pathname === '/seymour/day/progress' && request.method === 'GET') {
       try {
-        let claims = {};
-        try { claims = JSON.parse(await getMeta(env, 'ui_claims', '{}')) || {}; } catch (e) {}
-        const now = Date.now();
-        const live = Object.values(claims).filter(c => now - c.at < 240000);
-        return json({ helpers: new Set(live.map(c => c.by)).size,
-                      pages: live.length,
-                      tagIndex: parseInt(await getMeta(env, 'ui_tag_index', '0'), 10) || 0,
-                      page: parseInt(await getMeta(env, 'ui_page', '0'), 10) || 0 });
-      } catch (e) { return json({ helpers: 0, pages: 0 }); }
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_days (
+          day TEXT PRIMARY KEY, state TEXT, owner TEXT,
+          claimed_at INTEGER, done_at INTEGER, found INTEGER DEFAULT 0)`).run();
+        const DAY = 86400000;
+        const oldest = Date.parse('2023-02-01T00:00:00Z');
+        const total = Math.floor((Date.now() - oldest) / DAY) + 1;
+        const r = await env.DB.prepare(
+          `SELECT COUNT(*) AS done, MIN(day) AS earliest, SUM(found) AS found
+             FROM seymour_days WHERE state='done'`).first();
+        const active = await env.DB.prepare(
+          `SELECT day, owner, claimed_at FROM seymour_days
+            WHERE state='claimed' AND claimed_at > ? ORDER BY day DESC`)
+          .bind(Date.now() - 300000).all();
+        return json({
+          daysDone: r ? (r.done || 0) : 0, daysTotal: total,
+          earliestDay: r ? r.earliest : null, foundTotal: r ? (r.found || 0) : 0,
+          active: (active.results || []).map(a => ({ day: a.day, owner: a.owner }))
+        });
+      } catch (e) { return err('progress error: ' + e.message, 500); }
     }
 
     // ── Seymour: clear the Coflnet cooldown manually ─────────────────
