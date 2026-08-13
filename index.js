@@ -920,10 +920,44 @@ export default {
             stored++;
           } catch (e) { bad++; }
         }
-        if (stored) await setMeta(env, 'bf_last_run', Date.now());
+        if (stored) {
+          await setMeta(env, 'bf_last_run', Date.now());
+          await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_contrib (
+            uuid TEXT PRIMARY KEY, ign TEXT, sales INTEGER DEFAULT 0,
+            checked INTEGER DEFAULT 0, first_at INTEGER, last_at INTEGER)`).run();
+          await env.DB.prepare(
+            `INSERT INTO seymour_contrib (uuid, ign, sales, checked, first_at, last_at)
+             VALUES (?,?,?,?,?,?)
+             ON CONFLICT(uuid) DO UPDATE SET
+               ign = excluded.ign,
+               sales = seymour_contrib.sales + excluded.sales,
+               checked = seymour_contrib.checked + excluded.checked,
+               last_at = excluded.last_at`)
+            .bind(session.uuid, session.username || '', stored,
+                  parseInt(body.checked, 10) || rows.length, Date.now(), Date.now()).run();
+        }
         const tot = await env.DB.prepare(`SELECT COUNT(*) AS c FROM seymour_sales`).first();
         return json({ ok: true, stored, bad, total: tot ? tot.c : 0 });
       } catch (e) { return err('ingest error: ' + e.message, 500); }
+    }
+
+
+    // ── Seymour: contributor leaderboard ─────────────────────────────
+    if (url.pathname === '/seymour/leaderboard' && request.method === 'GET') {
+      try {
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS seymour_contrib (
+          uuid TEXT PRIMARY KEY, ign TEXT, sales INTEGER DEFAULT 0,
+          checked INTEGER DEFAULT 0, first_at INTEGER, last_at INTEGER)`).run();
+        const { results } = await env.DB.prepare(
+          `SELECT c.uuid, c.ign, c.sales, c.checked, c.last_at, u.discord
+             FROM seymour_contrib c LEFT JOIN users u ON u.uuid = c.uuid
+            WHERE c.sales > 0 ORDER BY c.sales DESC LIMIT 50`).all();
+        const tot = await env.DB.prepare(
+          `SELECT SUM(sales) AS s, COUNT(*) AS n FROM seymour_contrib`).first();
+        return json({ leaders: results || [],
+                      totalContributed: tot ? (tot.s || 0) : 0,
+                      contributors: tot ? (tot.n || 0) : 0 });
+      } catch (e) { return err('leaderboard error: ' + e.message, 500); }
     }
 
     // ── Seymour: claim the next page to scrape (multi-browser safe) ──
